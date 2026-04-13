@@ -1,3 +1,3 @@
 # Nerual Caption Generator with Vision Attention
 
-## Saket Murali (club basketball), Rohan Sampath (Intramural basketball MVP), Mihir Kulshreshtha (bhangra)
+## Saket Murali (IM basketball bench), Rohan Sampath (IM basketball MVP), Mihir Kulshreshtha (IM basketball coach)
