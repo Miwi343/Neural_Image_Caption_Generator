@@ -8,9 +8,11 @@ Target performance on Flickr8k (single model, Table 1):
   Soft-Attention:  BLEU-1=67  BLEU-2=44.8  BLEU-3=29.9  BLEU-4=19.5
   Hard-Attention:  BLEU-1=67  BLEU-2=45.7  BLEU-3=31.4  BLEU-4=21.3
 
-TODO (Issue #10): Verify NLTK corpus_bleu with method1 smoothing matches the
-                  original Perl BLEU script used by the paper authors.
-TODO (Issue #10): Add METEOR metric using the NLTK meteor_score function.
+TODO (Issue #10): Add a regression test with frozen hypotheses/references that
+checks BLEU-1..4 against expected NLTK outputs and documents any remaining gap
+vs. the original BLEU script cited by the paper.
+TODO (Issue #10, deferred): If the report scope expands beyond proposal BLEU,
+add METEOR via NLTK while keeping the existing BLEU-only API backward-compatible.
 """
 
 from typing import Dict, List
@@ -36,9 +38,11 @@ def compute_bleu(
     Returns:
         dict with keys "bleu1", "bleu2", "bleu3", "bleu4" → float in [0, 1]
 
-    TODO (Issue #10): Support token strings vs token ids — auto-detect and
-                      decode ids via a Vocabulary if needed.
-    TODO (Issue #10): Add option to compute per-image BLEU for error analysis.
+    TODO (Issue #10, deferred): If this utility is reused outside the current
+    pipeline, accept either token strings or token IDs and require a Vocabulary
+    only when ID decoding is actually needed.
+    TODO (Issue #10, deferred): Add an optional per-image BLEU return path for
+    error analysis, but keep the current corpus-level return dict as the default.
     """
     # Smoothing method 1: add epsilon to precision counts for n-grams with 0
     # count (avoids log(0) for short sentences)
@@ -47,8 +51,9 @@ def compute_bleu(
     scores = {}
     for n, key in enumerate(["bleu1", "bleu2", "bleu3", "bleu4"], start=1):
         weights = tuple(1.0 / n for _ in range(n)) + tuple(0.0 for _ in range(4 - n))
-        # TODO (Issue #10): Double-check weights format: corpus_bleu expects
-        #                   a 4-tuple where weights for higher n are 0.
+        # TODO (Issue #10): Add a unit test asserting the weight tuples are
+        # exactly `(1,0,0,0)`, `(0.5,0.5,0,0)`, `(1/3,1/3,1/3,0)`, and
+        # `(0.25,0.25,0.25,0.25)` before comparing BLEU outputs to the paper.
         scores[key] = corpus_bleu(
             references, hypotheses,
             weights=weights,
@@ -80,8 +85,12 @@ def print_bleu_table(
         Soft-Attention: BLEU-4 ≈ 19.5
         Hard-Attention: BLEU-4 ≈ 21.3
 
-    TODO (Issue #10): Include METEOR column.
-    TODO (Issue #10): Accept multiple model rows for side-by-side comparison.
+    TODO (Issue #10, deferred): If METEOR is added to `compute_bleu`, extend
+    this table formatter with a METEOR column without changing the current BLEU
+    column order used in existing logs.
+    TODO (Issue #10, deferred): If report generation needs it, accept multiple
+    model rows so paper baselines and several experiment runs can be printed in
+    one comparison table.
     """
     b1 = scores["bleu1"] * 100
     b2 = scores["bleu2"] * 100
@@ -95,7 +104,9 @@ def print_bleu_table(
     print(f"  {'Model':<30}  {'BLEU-1':>6}  {'BLEU-2':>6}  {'BLEU-3':>6}  {'BLEU-4':>6}")
     print("-" * 70)
     # Paper baselines for quick comparison
-    # TODO (Issue #10): Load baselines from a JSON config instead of hardcoding
+    # TODO (Issue #10, deferred): Move these baseline rows into a small JSON or
+    # constants module if multiple datasets/experiments need different reference
+    # tables; keep the current hardcoded values until that becomes necessary.
     baselines = [
         ("Soft-Attention (paper)", 67.0, 44.8, 29.9, 19.5),
         ("Hard-Attention (paper)", 67.0, 45.7, 31.4, 21.3),

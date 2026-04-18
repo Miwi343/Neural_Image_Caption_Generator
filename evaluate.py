@@ -4,10 +4,13 @@ Evaluation script: greedy decode, beam search, and full BLEU table.
 Usage:
     python evaluate.py --checkpoint checkpoints/best.pt --split test
 
-TODO (Issue #10): Add METEOR metric alongside BLEU
-TODO (Issue #11): Implement beam search and compare BLEU vs greedy
-TODO (Issue #11): Report results on all three splits (train/val/test) for the
-                  final report table
+TODO (Issue #10, deferred): If report scope expands beyond the proposal metric,
+add METEOR alongside BLEU while preserving the current BLEU-first output.
+TODO (Issue #11, deferred): If search-quality experiments are assigned, compare
+beam search against greedy decoding on the same checkpoint and log both BLEU and
+qualitative differences.
+TODO (Issue #11, deferred): If final-report automation is needed, add a runner
+that evaluates train/val/test in one pass and writes a combined results table.
 """
 
 import argparse
@@ -40,8 +43,12 @@ def greedy_decode(encoder, decoder, image, vocab, device, max_len=50):
         caption:  str — generated caption
         alphas:   (steps, 196) tensor — attention maps for visualisation
 
-    TODO (Issue #11): Vectorise over a batch for faster evaluation.
-    TODO (Issue #11): Return token IDs as well for downstream BLEU computation.
+    TODO (Issue #11): Refactor this into the shared greedy-decode helper used by
+    validation and visualization so all proposal-scope caption generation follows
+    one code path and returns identical token sequences.
+    TODO (Issue #11, deferred): If batch evaluation becomes necessary, add a
+    batched greedy path and optionally return token IDs alongside the decoded
+    string for downstream analysis.
     """
     encoder.eval()
     decoder.eval()
@@ -103,11 +110,12 @@ def beam_search_decode(encoder, decoder, image, vocab, device, beam_width=3, max
     Returns:
         best_caption: str
 
-    TODO (Issue #11): Currently a basic implementation; optimise with batched
-                      beam expansion for GPU efficiency.
-    TODO (Issue #11): Store and return attention weights for the best beam so
-                      beam search results can be visualised.
-    TODO (Issue #11): Add length normalisation penalty (common in NMT).
+    TODO (Issue #11, deferred): Replace the Python-loop beam expansion with a
+    batched implementation if beam search becomes part of the evaluation story.
+    TODO (Issue #11, deferred): Preserve and return attention maps for the best
+    beam if qualitative beam-search visualizations are needed.
+    TODO (Issue #11, deferred): Add a configurable length-normalization penalty
+    before comparing completed beams so short captions are not over-favored.
     """
     encoder.eval()
     decoder.eval()
@@ -116,8 +124,9 @@ def beam_search_decode(encoder, decoder, image, vocab, device, beam_width=3, max
     h, c = decoder._init_hidden(encoder_out)
 
     # Each beam: (score, token_ids, h, c)
-    # TODO (Issue #11): Expand encoder_out to (beam_width, 196, 512) for
-    #                   batched attention computation.
+    # TODO (Issue #11, deferred): If batched beam search is implemented, expand
+    # `encoder_out` to `(beam_width, 196, 512)` once here and keep beam state
+    # tensors aligned with that repeated encoder batch.
     beams = [(0.0, [1], h, c)]  # start with <start>
     completed = []
 
@@ -153,7 +162,8 @@ def beam_search_decode(encoder, decoder, image, vocab, device, beam_width=3, max
 
     if not completed:
         # If no beam completed, take the best active beam
-        # TODO (Issue #11): Apply length penalty before selecting best
+        # TODO (Issue #11, deferred): Apply the same length-normalization rule
+        # here that is used for completed beams so the fallback path is comparable.
         completed = [(b[0], b[1]) for b in beams]
 
     best_score, best_ids = max(completed, key=lambda x: x[0])
@@ -185,8 +195,10 @@ def evaluate_test_set(
         beam_width:      1 = greedy, >1 = beam search
         batch_size:      images per batch (beam search is currently 1 at a time)
 
-    TODO (Issue #10): Compute METEOR in addition to BLEU.
-    TODO (Issue #11): Support batch greedy decode to speed up evaluation.
+    TODO (Issue #10, deferred): If METEOR is added, keep the returned score dict
+    backward-compatible for callers that currently expect BLEU keys.
+    TODO (Issue #11, deferred): If test-time runtime matters, support batched
+    greedy decode while verifying captions match the existing one-image path.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -221,7 +233,9 @@ def evaluate_test_set(
         lambda enc, dec, img, v, d: (beam_search_decode(enc, dec, img, v, d, beam_width), None)
     )
 
-    # TODO (Issue #11): Wrap in @torch.inference_mode() for speed
+    # TODO (Issue #11, deferred): Replace `@torch.no_grad()` with
+    # `@torch.inference_mode()` once you have confirmed none of this path relies
+    # on autograd-compatible tensor metadata.
     for images, _, _, all_caps in tqdm(dataloader, desc=f"Evaluating [{split}]"):
         image = images[0:1].to(device)  # process one image at a time
         caption, _ = decode_fn(encoder, decoder, image, vocab, device)
@@ -243,7 +257,9 @@ def evaluate_test_set(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # TODO (Issue #11): Add --beam_width, --split, --data_root to argparse
+    # TODO (Issue #11, deferred): If this becomes the report-generation entry
+    # point, add a `--split all` mode and a `--results_out` path for writing a
+    # combined table under `results/`.
     parser = argparse.ArgumentParser(description="Evaluate Show, Attend and Tell")
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--data_root",  default="data/flickr8k")

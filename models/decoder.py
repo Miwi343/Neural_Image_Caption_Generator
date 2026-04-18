@@ -12,10 +12,15 @@ Key design choices that match the paper exactly:
   - Deep output layer: p(y_t) ∝ exp(L_o(E*y_{t-1} + L_h*h_t + L_z*ẑ_t))
     (Eq. 7).
 
-TODO (Issue #6): Add teacher forcing schedule (currently always teacher-forced
-                 during training; consider scheduled sampling for later epochs)
-TODO (Issue #6): Implement hard attention decoder variant
-TODO (Issue #6): Add beam search support to step() for use in evaluate.py
+TODO (Issue #6, deferred): Add scheduled sampling by introducing a
+teacher-forcing ratio that decays from train.py; the default must remain full
+teacher forcing so proposal-faithful runs are unchanged.
+TODO (Issue #6, deferred): If hard attention is added, thread the sampled
+context/index outputs and REINFORCE-specific losses through the decoder without
+breaking the current soft-attention training path.
+TODO (Issue #6): Extract a one-step decode helper that returns logits, hidden
+state, cell state, and alpha so greedy decoding and beam search stop duplicating
+decoder internals across evaluate.py and visualize.py.
 """
 
 import torch
@@ -31,8 +36,9 @@ class Decoder(nn.Module):
     During training, the full sequence is unrolled with teacher forcing.
     During inference, use greedy or beam search in evaluate.py.
 
-    TODO (Issue #6): Consider exposing scheduled sampling ratio as a
-                     hyperparameter set in train.py.
+    TODO (Issue #6, deferred): If scheduled sampling is implemented, expose the
+    teacher-forcing ratio and decay schedule in train.py while keeping the
+    default ratio at 1.0 for baseline proposal runs.
     """
 
     def __init__(
@@ -53,7 +59,9 @@ class Decoder(nn.Module):
             encoder_dim:   annotation vector dim     (D in the paper, =512)
             dropout:       dropout probability applied before deep output
 
-        TODO (Issue #6): Bundle args into a config dataclass.
+        TODO (Issue #6, deferred): If constructor cleanup is assigned, replace
+        the long positional arg list with a decoder config object shared by
+        training, evaluation, and visualization scripts.
         """
         super().__init__()
 
@@ -69,7 +77,9 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
         # LSTMCell input: [embedding || context_vector] = embed_dim + encoder_dim
-        # TODO (Issue #6): Verify this concatenation matches Eq. 1 input vector
+        # TODO (Issue #6): Add a short architecture note or test confirming that
+        # the explicit LSTMCell input is `[embedding_t, context_t]` and that
+        # `h_{t-1}` is already provided implicitly via the recurrent state tuple.
         self.lstm_cell = nn.LSTMCell(embed_dim + encoder_dim, decoder_dim)
 
         # Init MLPs: mean annotation → h0 / c0  (paper "init,c" and "init,h")
@@ -77,7 +87,9 @@ class Decoder(nn.Module):
         self.init_c = nn.Linear(encoder_dim, decoder_dim)
 
         # Beta gate: scalar ∈ (0,1) to weight the context vector (section 4.2.1)
-        # TODO (Issue #6): Confirm beta improves attention focus empirically
+        # TODO (Issue #6, deferred): Run an ablation with and without beta
+        # gating on Flickr8k, then record BLEU and qualitative attention-map
+        # differences before deciding whether to keep the gate permanently.
         self.f_beta = nn.Linear(decoder_dim, encoder_dim)
 
         # Deep output layer projections (Eq. 7):
@@ -93,8 +105,9 @@ class Decoder(nn.Module):
 
     def _init_weights(self):
         """Uniform initialisation for embedding and output layers."""
-        # TODO (Issue #6): Paper uses random init; check if Xavier gives better
-        #                  early convergence on Flickr8k.
+        # TODO (Issue #6, deferred): Compare the current uniform init to Xavier
+        # on a short Flickr8k training run and keep the simpler scheme unless
+        # the alternate init improves convergence or BLEU consistently.
         nn.init.uniform_(self.embedding.weight, -0.1, 0.1)
         nn.init.uniform_(self.L_o.weight, -0.1, 0.1)
         nn.init.constant_(self.L_o.bias, 0)
@@ -110,7 +123,8 @@ class Decoder(nn.Module):
             h: (batch, decoder_dim)
             c: (batch, decoder_dim)
 
-        TODO (Issue #6): Paper uses tanh; confirm activation is applied here.
+        TODO (Issue #6): Add a unit test asserting both `h0` and `c0` pass
+        through `tanh`, which keeps their values bounded in `[-1, 1]`.
         """
         mean_ann = encoder_out.mean(dim=1)   # (batch, D)
         h = torch.tanh(self.init_h(mean_ann))
@@ -136,8 +150,11 @@ class Decoder(nn.Module):
             alphas:       (batch, max_len-1, L)           attention weights
                           Used for doubly-stochastic regularisation (Eq. 14).
 
-        TODO (Issue #6): Return betas as well so callers can inspect gate values.
-        TODO (Issue #6): Replace teacher forcing with scheduled sampling.
+        TODO (Issue #6, deferred): If qualitative analysis expands beyond alpha
+        maps, return the per-step beta gates as an optional third output without
+        breaking current callers that unpack `(predictions, alphas)`.
+        TODO (Issue #6, deferred): If scheduled sampling is added, make it opt-in
+        and preserve the current always-teacher-forced path as the baseline.
         """
         batch_size = encoder_out.size(0)
         L = encoder_out.size(1)
@@ -148,7 +165,9 @@ class Decoder(nn.Module):
         h, c = self._init_hidden(encoder_out)
 
         # Pre-embed all tokens; we index into this at each step
-        # TODO (Issue #6): Apply dropout to embeddings (Zaremba et al. 2014)
+        # TODO (Issue #6, deferred): If embedding dropout is added, apply it
+        # once to `embeddings` here and verify train/eval mode toggles it
+        # correctly without changing tensor shapes.
         embeddings = self.embedding(captions)  # (batch, max_len, embed_dim)
 
         predictions = torch.zeros(batch_size, max_decode_len, self.vocab_size, device=encoder_out.device)
@@ -158,7 +177,9 @@ class Decoder(nn.Module):
             # Only process samples whose caption is still active at step t
             batch_size_t = sum([l > t for l in decode_lengths])
 
-            # TODO (Issue #6): Vectorise this mask instead of slicing by count
+            # TODO (Issue #6, deferred): Replace this prefix slice with a
+            # boolean active-sequence mask if you need support for unsorted or
+            # packed batches; verify the resulting logits still align with targets.
             z_hat, alpha = self.attention(
                 encoder_out[:batch_size_t], h[:batch_size_t]
             )
@@ -179,7 +200,9 @@ class Decoder(nn.Module):
 
             # Deep output (Eq. 7):
             # p ∝ exp(L_o(E*y_{t-1} + L_h*h_t + L_z*ẑ_t))
-            # TODO (Issue #6): Apply dropout before L_o as in Zaremba et al.
+            # TODO (Issue #6): Add a smoke test confirming dropout is applied to
+            # the deep-output sum before `L_o` during training and is disabled in
+            # eval mode; if that test is added, this note can be removed.
             preds = self.L_o(
                 self.dropout(
                     embeddings[:batch_size_t, t, :]  # E * y_{t-1}

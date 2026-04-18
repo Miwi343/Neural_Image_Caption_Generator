@@ -21,9 +21,15 @@ Key hyperparameters (paper / standard community values):
   NUM_EPOCHS     = 50
   PATIENCE       = 5     (early stop if BLEU-4 doesn't improve)
 
-TODO (Issue #7): Add learning rate scheduler (ReduceLROnPlateau on BLEU-4)
-TODO (Issue #8): Add DataParallel / DistributedDataParallel for multi-GPU
-TODO (Issue #9): Log training curves to TensorBoard or W&B for the report
+TODO (Issue #7, deferred): If training stability work is assigned, add
+`ReduceLROnPlateau` keyed on validation BLEU-4 and log exactly when the LR
+changes so runs remain comparable.
+TODO (Issue #8, deferred): If scaling beyond one GPU becomes necessary, wrap the
+model with DDP/DataParallel only after single-GPU training is stable and verify
+that checkpoint loading + BLEU parity still hold on 1 GPU.
+TODO (Issue #9, deferred): If experiment tracking is needed for the report, log
+loss and BLEU curves to TensorBoard or W&B without changing the default CLI-free
+training path.
 """
 
 import os
@@ -55,7 +61,9 @@ DATA_ROOT     = "data/flickr8k"
 VOCAB_PATH    = "data/flickr8k/vocab.json"
 CHECKPOINT_DIR = "checkpoints"
 
-# TODO (Issue #7): Replace with argparse so hyperparams can be swept from CLI
+# TODO (Issue #7, deferred): If run management gets more complex, replace these
+# module-level constants with argparse flags while keeping the current values as
+# defaults for a drop-in baseline run.
 
 
 def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoch):
@@ -76,8 +84,11 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
     Returns:
         avg_loss: float
 
-    TODO (Issue #7): Track top-5 word accuracy as a secondary training metric.
-    TODO (Issue #9): Emit per-step loss to TensorBoard.
+    TODO (Issue #7, deferred): If extra training diagnostics are useful, compute
+    top-5 next-word accuracy from `predictions` vs `targets` and report it
+    alongside loss without affecting optimisation.
+    TODO (Issue #9, deferred): If TensorBoard/W&B logging is enabled, emit
+    per-step and per-epoch loss here using stable metric names.
     """
     encoder.eval()   # encoder stays frozen — no batch norm updates needed
     decoder.train()
@@ -101,8 +112,9 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
 
         # Targets are captions shifted left by one (exclude <start>)
         # Shape: (batch * (max_len-1),)
-        # TODO (Issue #7): Verify target alignment — captions[:, 1:] should be
-        #                  the words the model must predict at each step.
+        # TODO (Issue #7): Add a tiny regression test confirming that
+        # `captions[:, 1:]` is the correct next-token target for the decoder
+        # outputs produced from inputs that still include `<start>`.
         targets = captions[:, 1:]   # (batch, max_len-1)
 
         # Flatten for cross-entropy
@@ -115,7 +127,9 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
         # Doubly stochastic attention regularisation (Eq. 14):
         # Σ_i (1 - Σ_t α_ti)²  — encourage each spatial location to be
         # attended to roughly equally over the generation sequence.
-        # TODO (Issue #7): Confirm sum is over time dimension (dim=1) not location
+        # TODO (Issue #7): Add a shape check or test proving that `alphas.sum(dim=1)`
+        # sums over decoding steps, leaving one regularization term per image
+        # location as required by the doubly-stochastic penalty.
         loss_ds = LAMBDA * ((1.0 - alphas.sum(dim=1)) ** 2).mean()
 
         loss = loss_ce + loss_ds
@@ -138,13 +152,18 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
 @torch.no_grad()
 def validate(encoder, decoder, dataloader, vocab, device):
     """
-    Greedy-decode the validation set and compute BLEU-4.
+    Greedy-decode the validation set and compute BLEU scores.
 
     Returns:
-        bleu4: float  (used for early stopping and checkpointing)
+        dict with keys `bleu1`/`bleu2`/`bleu3`/`bleu4`; `bleu4` remains the
+        checkpoint-selection metric.
 
-    TODO (Issue #9): Also compute BLEU-1/2/3 and log all four.
-    TODO (Issue #10): Optionally run beam search here instead of greedy.
+    TODO (Issue #9): Change `validate()` to return the full BLEU dict and update
+    `main()` logging to print all four scores while still early-stopping on
+    `scores["bleu4"]`.
+    TODO (Issue #10, deferred): If a beam-search comparison is needed for the
+    report, add it as an explicit alternate validation path; do not replace the
+    current greedy baseline silently.
     """
     encoder.eval()
     decoder.eval()
@@ -159,7 +178,9 @@ def validate(encoder, decoder, dataloader, vocab, device):
         batch_size = images.size(0)
 
         # Greedy decode — one sample at a time for simplicity
-        # TODO (Issue #10): Vectorise greedy decode over the batch
+        # TODO (Issue #10, deferred): If validation throughput becomes a bottleneck,
+        # vectorize greedy decoding across the batch and verify hypotheses remain
+        # identical to the current per-image implementation.
         for i in range(batch_size):
             ann = encoder_out[i].unsqueeze(0)  # (1, 196, 512)
             h, c = decoder._init_hidden(ann)
@@ -203,9 +224,14 @@ def main():
     """
     Full training loop with checkpointing and early stopping.
 
-    TODO (Issue #7): Add argparse for data_root, checkpoint_dir, hyperparams.
-    TODO (Issue #8): Support resuming from a checkpoint mid-training.
-    TODO (Issue #9): Log final BLEU table at the end of training.
+    TODO (Issue #7, deferred): If CLI usage expands, expose `data_root`,
+    `checkpoint_dir`, and key hyperparameters via argparse while preserving the
+    current constant defaults.
+    TODO (Issue #8, deferred): If resume support is needed, load epoch/model/
+    optimizer state from a checkpoint and resume the early-stopping counters
+    without changing the non-resume path.
+    TODO (Issue #9, deferred): If report generation is scripted, print a final
+    BLEU summary table at the end of training using the last validation scores.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -213,7 +239,9 @@ def main():
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     # Build or load vocabulary
-    # TODO (Issue #2): Expose vocab building as a separate CLI command
+    # TODO (Issue #2, deferred): If dataset setup is split into multiple scripts,
+    # move vocab construction into a dedicated command and keep this fallback
+    # path for small one-shot training runs.
     if os.path.exists(VOCAB_PATH):
         print("Loading vocabulary...")
         vocab = Vocabulary.load(VOCAB_PATH)
@@ -244,7 +272,9 @@ def main():
     ).to(device)
 
     # Optimise only the decoder (encoder is frozen)
-    # TODO (Issue #7): After warm-up epochs, add encoder params with lower LR
+    # TODO (Issue #7, deferred): If encoder fine-tuning is enabled later,
+    # introduce a second optimizer param group with a lower LR after the chosen
+    # warm-up epoch and document the schedule clearly.
     optimizer = Adam(decoder.parameters(), lr=4e-4)
 
     criterion = nn.CrossEntropyLoss(ignore_index=0)  # PAD_IDX = 0
@@ -266,7 +296,9 @@ def main():
         )
 
         # Checkpoint every epoch
-        # TODO (Issue #9): Also save optimizer state for resumable training
+        # TODO (Issue #9, deferred): If resume-from-best is required, keep saving
+        # optimizer state here and mirror it into `best.pt` as well so both
+        # checkpoint formats remain usable.
         ckpt_path = os.path.join(CHECKPOINT_DIR, f"epoch_{epoch:03d}.pt")
         torch.save({
             "epoch": epoch,
