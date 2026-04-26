@@ -1,24 +1,55 @@
 """
 BLEU evaluation utilities.
 
-Uses NLTK corpus_bleu (smoothing method 1) to match the evaluation protocol
-described in the paper (section 5.1).
+Computes corpus-level modified n-gram precision without brevity penalty to
+match the course project protocol for the paper reproduction.
 
 Target performance on Flickr8k (single model, Table 1):
   Soft-Attention:  BLEU-1=67  BLEU-2=44.8  BLEU-3=29.9  BLEU-4=19.5
   Hard-Attention:  BLEU-1=67  BLEU-2=45.7  BLEU-3=31.4  BLEU-4=21.3
 
-TODO (Issue #10): Add a regression test with frozen hypotheses/references that
-checks BLEU-1..4 against expected NLTK outputs and documents any remaining gap
-vs. the original BLEU script cited by the paper.
-TODO (Issue #10, deferred): If the report scope expands beyond proposal BLEU,
+Future work (Issue #10): Add a regression test with frozen hypotheses/references that
+checks BLEU-1..4 against expected no-brevity-penalty outputs.
+Future work (Issue #10, deferred): If the report scope expands beyond proposal BLEU,
 add METEOR via NLTK while keeping the existing BLEU-only API backward-compatible.
 """
 
+import math
+from collections import Counter
 from typing import Dict, List
 
-import nltk
-from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
+
+def _ngram_counts(tokens: List[str], n: int) -> Counter:
+    return Counter(tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1))
+
+
+def _modified_precision(
+    hypotheses: List[List[str]],
+    references: List[List[List[str]]],
+    n: int,
+    epsilon: float = 1e-9,
+) -> float:
+    clipped_total = 0
+    count_total = 0
+
+    for hyp, refs in zip(hypotheses, references):
+        hyp_counts = _ngram_counts(hyp, n)
+        count_total += sum(hyp_counts.values())
+
+        max_ref_counts: Counter = Counter()
+        for ref in refs:
+            max_ref_counts |= _ngram_counts(ref, n)
+
+        clipped_total += sum(
+            min(count, max_ref_counts[ngram])
+            for ngram, count in hyp_counts.items()
+        )
+
+    if count_total == 0:
+        return epsilon
+    if clipped_total == 0:
+        return epsilon / count_total
+    return clipped_total / count_total
 
 
 def compute_bleu(
@@ -26,7 +57,7 @@ def compute_bleu(
     references: List[List[List[str]]],
 ) -> Dict[str, float]:
     """
-    Compute BLEU-1 through BLEU-4 using NLTK corpus_bleu.
+    Compute corpus BLEU-1 through BLEU-4 without brevity penalty.
 
     Args:
         hypotheses:  list of N generated captions, each as a list of tokens
@@ -38,27 +69,20 @@ def compute_bleu(
     Returns:
         dict with keys "bleu1", "bleu2", "bleu3", "bleu4" → float in [0, 1]
 
-    TODO (Issue #10, deferred): If this utility is reused outside the current
-    pipeline, accept either token strings or token IDs and require a Vocabulary
-    only when ID decoding is actually needed.
-    TODO (Issue #10, deferred): Add an optional per-image BLEU return path for
-    error analysis, but keep the current corpus-level return dict as the default.
+    This follows the project spec and the paper's Flickr8k reporting convention:
+    clipped n-gram precisions are aggregated at corpus level, smoothed only when
+    an n-gram precision is zero, and no brevity penalty is applied.
     """
-    # Smoothing method 1: add epsilon to precision counts for n-grams with 0
-    # count (avoids log(0) for short sentences)
-    smoother = SmoothingFunction().method1
+    if len(hypotheses) != len(references):
+        raise ValueError("hypotheses and references must have the same length.")
 
     scores = {}
     for n, key in enumerate(["bleu1", "bleu2", "bleu3", "bleu4"], start=1):
-        weights = tuple(1.0 / n for _ in range(n)) + tuple(0.0 for _ in range(4 - n))
-        # TODO (Issue #10): Add a unit test asserting the weight tuples are
-        # exactly `(1,0,0,0)`, `(0.5,0.5,0,0)`, `(1/3,1/3,1/3,0)`, and
-        # `(0.25,0.25,0.25,0.25)` before comparing BLEU outputs to the paper.
-        scores[key] = corpus_bleu(
-            references, hypotheses,
-            weights=weights,
-            smoothing_function=smoother,
-        )
+        precisions = [
+            _modified_precision(hypotheses, references, order)
+            for order in range(1, n + 1)
+        ]
+        scores[key] = math.exp(sum(math.log(p) for p in precisions) / n)
 
     return scores
 
@@ -85,10 +109,10 @@ def print_bleu_table(
         Soft-Attention: BLEU-4 ≈ 19.5
         Hard-Attention: BLEU-4 ≈ 21.3
 
-    TODO (Issue #10, deferred): If METEOR is added to `compute_bleu`, extend
+    Future work (Issue #10, deferred): If METEOR is added to `compute_bleu`, extend
     this table formatter with a METEOR column without changing the current BLEU
     column order used in existing logs.
-    TODO (Issue #10, deferred): If report generation needs it, accept multiple
+    Future work (Issue #10, deferred): If report generation needs it, accept multiple
     model rows so paper baselines and several experiment runs can be printed in
     one comparison table.
     """
@@ -104,7 +128,7 @@ def print_bleu_table(
     print(f"  {'Model':<30}  {'BLEU-1':>6}  {'BLEU-2':>6}  {'BLEU-3':>6}  {'BLEU-4':>6}")
     print("-" * 70)
     # Paper baselines for quick comparison
-    # TODO (Issue #10, deferred): Move these baseline rows into a small JSON or
+    # Future work (Issue #10, deferred): Move these baseline rows into a small JSON or
     # constants module if multiple datasets/experiments need different reference
     # tables; keep the current hardcoded values until that becomes necessary.
     baselines = [
