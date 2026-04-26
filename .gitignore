@@ -4,3 +4,4 @@ checkpoints/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+data/flickr8k/captions.txt
