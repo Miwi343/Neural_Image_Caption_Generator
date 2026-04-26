@@ -4,10 +4,10 @@ Encoder: CNN feature extractor.
 Paper section 3.1.1 — extract annotation vectors a_i ∈ R^D from a lower
 convolutional layer so the decoder can selectively attend to spatial locations.
 
-TODO (Issue #4): Add a shape regression test using a `224x224` input tensor
+Future work (Issue #4): Add a shape regression test using a `224x224` input tensor
 that asserts `self.cnn(images)` is `(B, 512, 14, 14)` and `forward(images)` is
 `(B, 196, 512)`.
-TODO (Issue #4, deferred): Add an encoder fine-tuning schedule that keeps the
+Future work (Issue #4, deferred): Add an encoder fine-tuning schedule that keeps the
 encoder frozen initially, then unfreezes only the top conv layers with a smaller
 learning rate after a configurable warm-up epoch.
 """
@@ -41,7 +41,7 @@ class Encoder(nn.Module):
     Output shape: (batch_size, L, D) = (batch_size, 196, 512)
     where L = 14*14 = 196 annotation locations and D = 512 channels.
 
-    TODO (Issue #4, deferred): If fine-tuning is assigned, expose exactly which
+    Future work (Issue #4, deferred): If fine-tuning is assigned, expose exactly which
     VGG layers are unfrozen and preserve the current frozen-by-default behavior
     for the proposal reproduction.
     """
@@ -59,7 +59,7 @@ class Encoder(nn.Module):
         for param in self.cnn.parameters():
             param.requires_grad = False
 
-        # TODO (Issue #4, deferred): Keep `fine_tune=False` as the default; if
+        # Future work (Issue #4, deferred): Keep `fine_tune=False` as the default; if
         # `True`, prove via a parameter-count or requires_grad check that only
         # the intended top layers become trainable.
         if fine_tune:
@@ -67,7 +67,7 @@ class Encoder(nn.Module):
 
     def _enable_fine_tune(self):
         """Unfreeze the last two conv blocks for fine-tuning."""
-        # TODO (Issue #4, deferred): Restrict unfreezing to `self.cnn[20:]` or a
+        # Future work (Issue #4, deferred): Restrict unfreezing to `self.cnn[20:]` or a
         # narrower top-block slice, then document the exact layer indices and
         # optimizer LR used for those params.
         for param in self.cnn[20:].parameters():
@@ -81,7 +81,7 @@ class Encoder(nn.Module):
         Returns:
             features: (batch_size, L, D) = (batch_size, 196, 512)
 
-        TODO (Issue #4): Raise a clear assertion or ValueError if the CNN output
+        Future work (Issue #4): Raise a clear assertion or ValueError if the CNN output
         is not `(batch, 512, 14, 14)` so preprocessing/model-slice mistakes fail
         fast instead of silently corrupting attention geometry.
         """
@@ -89,10 +89,15 @@ class Encoder(nn.Module):
         out = self.cnn(images)
 
         batch_size, D, H, W = out.shape  # D=512, H=W=14
+        if (D, H, W) != (512, 14, 14):
+            raise ValueError(
+                "VGG encoder expected a (batch, 512, 14, 14) feature map from "
+                f"224x224 ImageNet-normalized images, got {tuple(out.shape)}."
+            )
         L = H * W  # 196
 
         # Reshape to (batch, L, D) so each of the 196 locations is a vector
-        # TODO (Issue #4): Add a tensor-ordering test confirming this permute +
+        # Future work (Issue #4): Add a tensor-ordering test confirming this permute +
         # flatten keeps each annotation vector length `D=512` and maps the
         # 14x14 spatial grid to `L=196` locations in a deterministic order.
         out = out.permute(0, 2, 3, 1)   # (batch, 14, 14, 512)

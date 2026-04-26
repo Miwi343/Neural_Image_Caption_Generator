@@ -1,5 +1,4 @@
-"""
-Attention visualisation — recreates paper Figures 2 and 3.
+"""Attention visualisation for generated captions.
 
 For each generated word, the 196-dimensional attention weight vector α is:
   1. Reshaped to (14, 14).
@@ -11,29 +10,26 @@ Paper section 5.4:
   "We simply upsample the weights by a factor of 2^4 = 16 and apply a
    Gaussian filter."
 
-TODO (Issue #12): Make figure export report-ready by allowing a higher DPI and
-explicit `.png` / `.pdf` save path so collaborators can generate publication
-quality artifacts without editing matplotlib internals.
-TODO (Issue #12): Recreate the paper Figure 2 layout exactly: original image in
-cell 0, one panel per generated word, consistent word titles, and no unused axes
-left visible in the saved output.
 """
 
+import glob
 import math
 import os
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import matplotlib
 matplotlib.use("Agg")   # headless default; override to "TkAgg" for interactive
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 from torchvision import transforms
 
+from config import ATTENTION_DIM, DECODER_DIM, EMBED_DIM, MAX_DECODE_LEN
 from models import Encoder, Decoder
-from utils import Vocabulary
+from utils import Vocabulary, greedy_decode, load_flickr8k_captions
 
 # ---------------------------------------------------------------------------
 # ImageNet inverse transform for display
@@ -68,6 +64,9 @@ def visualize_attention(
     save_path: Optional[str] = None,
     show: bool = False,
     title: str = "",
+    dpi: int = 200,
+    sigma: float = 8.0,
+    overlay_style: str = "paper",
 ) -> None:
     """
     Plot the word-by-word attention overlay, matching paper Figures 2 & 3.
@@ -80,21 +79,19 @@ def visualize_attention(
         show:          if True, call plt.show() (requires a display)
         title:         optional figure suptitle
 
-    TODO (Issue #12, deferred): If hard attention is implemented, accept sampled
-    location indices and render them as discrete highlights instead of smooth α
-    maps while preserving the current soft-attention API.
-    TODO (Issue #12, deferred): If poster/report visuals need it, add an optional
-    colorbar legend that can be toggled off to preserve the paper-style layout.
-    TODO (Issue #12): Replace the current jet overlay with the paper-style
-    white-highlight / grayscale attention rendering used in Figures 2 and 3 so
-    saved examples look consistent with the reproduced method.
+        dpi:           output DPI
+        sigma:         Gaussian blur strength after upsampling
+        overlay_style: "paper" for grayscale/white highlight or "heatmap"
     """
+    if overlay_style not in {"paper", "heatmap"}:
+        raise ValueError("overlay_style must be 'paper' or 'heatmap'.")
+
     img_np = _unnormalize(image_tensor)   # (224, 224, 3)
 
     n_words = len(caption_words)
     # Grid: original image + one cell per word, wrap at 4 columns
     n_cols = 4
-    n_rows = math.ceil((n_words + 1) / n_cols)
+    n_rows = max(1, math.ceil((n_words + 1) / n_cols))
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
     axes = axes.flatten()
@@ -107,26 +104,39 @@ def visualize_attention(
     for t, word in enumerate(caption_words):
         ax = axes[t + 1]
 
-        # Reshape α from (196,) to (14, 14)
-        alpha_map = alphas[t].numpy().reshape(14, 14)
+        # Reshape α from (196,) to (14, 14), then upsample by 16 to (224, 224).
+        alpha_map = alphas[t].view(1, 1, 14, 14)
+        alpha_up = F.interpolate(
+            alpha_map,
+            size=(224, 224),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze().numpy()
 
-        # Upsample by 16 to (224, 224) — matches paper section 5.4
-        # TODO (Issue #12): Replace `scipy.ndimage.zoom` with
-        # `torch.nn.functional.interpolate(..., mode="bilinear")` so the
-        # upsampling path matches the intended 14x14 -> 224x224 geometry exactly.
-        from scipy.ndimage import zoom
-        alpha_up = zoom(alpha_map, 16, order=1)   # bilinear zoom
+        alpha_smooth = gaussian_filter(alpha_up, sigma=sigma)
+        max_alpha = float(alpha_smooth.max())
+        if max_alpha > 0:
+            alpha_smooth = alpha_smooth / max_alpha
 
-        # Gaussian blur (σ ~ 8 pixels after upsampling)
-        # TODO (Issue #12): Tune `sigma` against a few representative Flickr8k
-        # examples until the blur strength visually matches the paper's figures,
-        # then promote the chosen value to a named constant.
-        alpha_smooth = gaussian_filter(alpha_up, sigma=8)
-
-        # Overlay: show original image with attention heatmap on top
-        ax.imshow(img_np)
-        ax.imshow(alpha_smooth, alpha=0.5, cmap="jet",
-                  extent=[0, 224, 224, 0])  # match image coordinates
+        if overlay_style == "paper":
+            gray = np.dot(img_np[..., :3], [0.299, 0.587, 0.114])
+            ax.imshow(gray, cmap="gray", vmin=0, vmax=255)
+            ax.imshow(
+                alpha_smooth,
+                alpha=np.clip(alpha_smooth * 0.85, 0.0, 0.85),
+                cmap="gray",
+                vmin=0,
+                vmax=1,
+                extent=[0, 224, 224, 0],
+            )
+        else:
+            ax.imshow(img_np)
+            ax.imshow(
+                alpha_smooth,
+                alpha=0.5,
+                cmap="jet",
+                extent=[0, 224, 224, 0],
+            )
 
         ax.set_title(word, fontsize=10)
         ax.axis("off")
@@ -142,7 +152,7 @@ def visualize_attention(
 
     if save_path:
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        plt.savefig(save_path, bbox_inches="tight", dpi=150)
+        plt.savefig(save_path, bbox_inches="tight", dpi=dpi)
         print(f"Saved attention figure → {save_path}")
 
     if show:
@@ -160,8 +170,10 @@ def run_visualization(
     checkpoint_path: str,
     vocab_path: str,
     image_paths: List[str],
-    output_dir: str = "visualizations",
-    beam_width: int = 1,
+    output_dir: str = "results/attention_examples",
+    dpi: int = 200,
+    sigma: float = 8.0,
+    overlay_style: str = "paper",
 ):
     """
     Load a checkpoint, generate captions, and save attention figures for each
@@ -172,13 +184,6 @@ def run_visualization(
         vocab_path:      path to vocab.json
         image_paths:     list of image file paths to caption & visualise
         output_dir:      directory to write PNG files
-        beam_width:      1 = greedy (default)
-
-    TODO (Issue #12): Accept either explicit image paths or a directory/glob so
-    collaborators can render many qualitative examples without shell scripting.
-    TODO (Issue #12, deferred): Add a `--grid` mode that composes several images
-    into one multi-example figure for poster/report use, matching the spirit of
-    paper Figure 3.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -187,9 +192,9 @@ def run_visualization(
 
     encoder = Encoder(fine_tune=False).to(device)
     decoder = Decoder(
-        attention_dim=512,
-        embed_dim=512,
-        decoder_dim=512,
+        attention_dim=ATTENTION_DIM,
+        embed_dim=EMBED_DIM,
+        decoder_dim=DECODER_DIM,
         vocab_size=len(vocab),
         dropout=0.0,
     ).to(device)
@@ -207,37 +212,15 @@ def run_visualization(
         img_tensor = _EVAL_TRANSFORM(pil_img)           # (3, 224, 224) normalised
         img_batch  = img_tensor.unsqueeze(0).to(device)  # (1, 3, 224, 224)
 
-        # Encode
-        encoder_out = encoder(img_batch)           # (1, 196, 512)
-        h, c = decoder._init_hidden(encoder_out)
-
-        word_idx  = torch.tensor([1], dtype=torch.long, device=device)
-        words     = []
-        alpha_list = []
-
-        # TODO (Issue #12): Replace this duplicated decode loop with the shared
-        # greedy-decode helper from evaluation so validation captions and saved
-        # attention maps are generated by the exact same logic.
-        for _ in range(50):
-            embed  = decoder.embedding(word_idx)
-            z_hat, alpha = decoder.attention(encoder_out, h)
-            beta   = torch.sigmoid(decoder.f_beta(h))
-            z_hat  = beta * z_hat
-
-            lstm_input = torch.cat([embed, z_hat], dim=1)
-            h, c = decoder.lstm_cell(lstm_input, (h, c))
-
-            logits   = decoder.L_o(embed + decoder.L_h(h) + decoder.L_z(z_hat))
-            word_idx = logits.argmax(dim=1)
-
-            alpha_list.append(alpha.squeeze(0).cpu())  # (196,)
-            idx = word_idx.item()
-            if idx == 2:  # <end>
-                break
-            words.append(vocab.idx2word.get(idx, "<unk>"))
-
-        alphas = torch.stack(alpha_list, dim=0)  # (steps, 196)
-        caption = " ".join(words)
+        caption, alphas, token_ids = greedy_decode(
+            encoder,
+            decoder,
+            img_batch,
+            vocab,
+            device,
+            max_len=MAX_DECODE_LEN,
+        )
+        words = [vocab.idx2word.get(idx, "<unk>") for idx in token_ids]
         print(f"  Caption: {caption}")
 
         img_name  = os.path.splitext(os.path.basename(img_path))[0]
@@ -249,7 +232,27 @@ def run_visualization(
             save_path=save_path,
             show=False,
             title=caption,
+            dpi=dpi,
+            sigma=sigma,
+            overlay_style=overlay_style,
         )
+
+
+def expand_image_inputs(inputs: Optional[List[str]]) -> List[str]:
+    """Expand explicit image paths, directories, and glob patterns."""
+    if not inputs:
+        return []
+
+    image_paths: List[str] = []
+    for item in inputs:
+        if os.path.isdir(item):
+            for ext in ("*.jpg", "*.jpeg", "*.png"):
+                image_paths.extend(glob.glob(os.path.join(item, ext)))
+        else:
+            matches = glob.glob(item)
+            image_paths.extend(matches or [item])
+
+    return sorted(dict.fromkeys(image_paths))
 
 
 # ---------------------------------------------------------------------------
@@ -259,19 +262,34 @@ def run_visualization(
 if __name__ == "__main__":
     import argparse
 
-    # TODO (Issue #12, deferred): Add a `--show` flag for interactive notebook/
-    # Colab use while keeping headless saving as the default CLI behavior.
     parser = argparse.ArgumentParser(description="Visualise attention maps")
     parser.add_argument("--checkpoint",  default="checkpoints/best.pt")
     parser.add_argument("--vocab",       default="data/flickr8k/vocab.json")
-    parser.add_argument("--images",      nargs="+", required=True,
+    parser.add_argument("--images",      nargs="+",
                         help="Paths to one or more images")
-    parser.add_argument("--output_dir",  default="visualizations")
+    parser.add_argument("--data_root",   default="data/flickr8k")
+    parser.add_argument("--split",       default="test", choices=["val", "test"])
+    parser.add_argument("--num_examples", type=int, default=6)
+    parser.add_argument("--output_dir",  default="results/attention_examples")
+    parser.add_argument("--dpi", type=int, default=200)
+    parser.add_argument("--sigma", type=float, default=8.0)
+    parser.add_argument("--overlay_style", default="paper", choices=["paper", "heatmap"])
     args = parser.parse_args()
+
+    image_paths = expand_image_inputs(args.images)
+    if not image_paths:
+        image_to_caps = load_flickr8k_captions(args.data_root, args.split)
+        image_paths = [
+            os.path.join(args.data_root, "images", img_name)
+            for img_name in sorted(image_to_caps.keys())[: args.num_examples]
+        ]
 
     run_visualization(
         checkpoint_path=args.checkpoint,
         vocab_path=args.vocab,
-        image_paths=args.images,
+        image_paths=image_paths,
         output_dir=args.output_dir,
+        dpi=args.dpi,
+        sigma=args.sigma,
+        overlay_style=args.overlay_style,
     )

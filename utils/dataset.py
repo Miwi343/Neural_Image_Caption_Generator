@@ -15,23 +15,18 @@ Special tokens:
   END = 2   (<end> appended to every caption)
   UNK = 3   (words outside the top-10000 vocabulary)
 
-TODO (Issue #2): Add an explicit dataset-layout validator that checks
-`data/flickr8k/images/`, `captions.txt`, and the three split files before any
-training/evaluation run; raise FileNotFoundError with the exact expected tree and
-state clearly that dataset download/setup is manual.
-TODO (Issue #3): Validate that the official Flickr8k split files contain exactly
-`train=6000`, `val=1000`, `test=1000` unique image names and `8000` unique
-images in total before constructing the dataset object.
-TODO (Issue #8, deferred): If the project switches to `pack_padded_sequence` or
+Future work (Issue #8, deferred): If the project switches to `pack_padded_sequence` or
 `nn.LSTM`, sort collated batches by descending caption length and add a regression
 test that verifies both padding placement and length order.
 """
 
+import csv
 import json
 import os
 import random
+import re
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -47,6 +42,137 @@ START_IDX = 1
 END_IDX = 2
 UNK_IDX = 3
 
+SPLIT_FILE_MAP = {
+    "train": "Flickr_8k.trainImages.txt",
+    "val": "Flickr_8k.devImages.txt",
+    "test": "Flickr_8k.testImages.txt",
+}
+
+EXPECTED_SPLIT_COUNTS = {
+    "train": 6000,
+    "val": 1000,
+    "test": 1000,
+}
+
+_PUNCT_RE = re.compile(r"[^\w\s]")
+
+
+def tokenize_caption(caption: str) -> List[str]:
+    """Lowercase, strip punctuation, and split on whitespace."""
+    caption = _PUNCT_RE.sub(" ", caption.lower())
+    return caption.split()
+
+
+def _normalize_image_name(image_id: str) -> str:
+    """Drop Flickr8k caption suffixes like ``#0`` and keep the basename."""
+    return os.path.basename(image_id.strip().split("#")[0])
+
+
+def validate_dataset_layout(data_root: str, strict_split_counts: bool = True) -> None:
+    """
+    Validate the expected Flickr8k/Karpathy directory layout before training.
+
+    Expected tree:
+        data/flickr8k/
+            images/
+            captions.txt
+            Flickr_8k.trainImages.txt
+            Flickr_8k.devImages.txt
+            Flickr_8k.testImages.txt
+    """
+    expected = [
+        os.path.join(data_root, "images"),
+        os.path.join(data_root, "captions.txt"),
+        *[os.path.join(data_root, name) for name in SPLIT_FILE_MAP.values()],
+    ]
+    missing = [path for path in expected if not os.path.exists(path)]
+    if missing:
+        layout = "\n".join(f"  - {path}" for path in expected)
+        missing_text = "\n".join(f"  - {path}" for path in missing)
+        raise FileNotFoundError(
+            "Flickr8k files are missing.\n"
+            f"Expected layout:\n{layout}\n"
+            f"Missing:\n{missing_text}\n"
+            "Download Flickr8k manually from Kaggle and place it under data/flickr8k/."
+        )
+
+    if not strict_split_counts:
+        return
+
+    split_sets: Dict[str, set] = {}
+    for split, filename in SPLIT_FILE_MAP.items():
+        split_path = os.path.join(data_root, filename)
+        with open(split_path) as f:
+            names = {_normalize_image_name(line) for line in f if line.strip()}
+        expected_count = EXPECTED_SPLIT_COUNTS[split]
+        if len(names) != expected_count:
+            raise ValueError(
+                f"{filename} contains {len(names)} unique images; expected "
+                f"{expected_count} for the standard Flickr8k split."
+            )
+        split_sets[split] = names
+
+    all_images = set().union(*split_sets.values())
+    if len(all_images) != sum(EXPECTED_SPLIT_COUNTS.values()):
+        raise ValueError(
+            "Train/val/test split files overlap or are incomplete; expected "
+            "8000 unique image names across the standard Flickr8k splits."
+        )
+
+
+def _read_split_images(data_root: str, split: str) -> set:
+    split_path = os.path.join(data_root, SPLIT_FILE_MAP[split])
+    with open(split_path) as f:
+        return {_normalize_image_name(line) for line in f if line.strip()}
+
+
+def _read_caption_rows(caps_path: str):
+    with open(caps_path, newline="") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if "\t" in line:
+                image_id, caption = line.split("\t", 1)
+            else:
+                row = next(csv.reader([line]))
+                if len(row) < 2:
+                    continue
+                if row[0].lower() in {"image", "image_name", "filename"}:
+                    continue
+                image_id, caption = row[0], ",".join(row[1:])
+
+            yield _normalize_image_name(image_id), caption.strip()
+
+
+def load_flickr8k_captions(
+    data_root: str,
+    split: str,
+    strict_split_counts: bool = True,
+) -> Dict[str, List[str]]:
+    """Load raw captions for one standard Flickr8k split."""
+    assert split in ("train", "val", "test"), f"Unknown split: {split}"
+    validate_dataset_layout(data_root, strict_split_counts=strict_split_counts)
+
+    split_images = _read_split_images(data_root, split)
+    caps_path = os.path.join(data_root, "captions.txt")
+    image_to_caps: Dict[str, List[str]] = {}
+
+    for img_name, caption in _read_caption_rows(caps_path):
+        if img_name in split_images:
+            image_to_caps.setdefault(img_name, []).append(caption)
+
+    missing_captions = sorted(split_images - set(image_to_caps))
+    if missing_captions:
+        preview = ", ".join(missing_captions[:5])
+        raise ValueError(
+            f"{len(missing_captions)} split images have no captions in captions.txt "
+            f"(first few: {preview})."
+        )
+
+    return image_to_caps
+
 
 class Vocabulary:
     """
@@ -56,10 +182,10 @@ class Vocabulary:
     (excluding specials).  Save/load as JSON so the vocab can be reused
     across runs without rebuilding from scratch.
 
-    TODO (Issue #2, deferred): If vocabulary tuning is assigned, add a
+    Future work (Issue #2, deferred): If vocabulary tuning is assigned, add a
     `min_freq` mode alongside top-K and confirm serialized vocabs still round-trip
     through `save()` / `load()` without changing special-token indices.
-    TODO (Issue #2, deferred): If subword tokenization is explored, keep it behind
+    Future work (Issue #2, deferred): If subword tokenization is explored, keep it behind
     a separate code path and report whether it improves Flickr8k BLEU enough to
     justify changing the current simple word-level baseline.
     """
@@ -76,16 +202,16 @@ class Vocabulary:
 
     def build(self, captions: List[str]) -> None:
         """
-        Tokenise captions (simple whitespace split + lower) and keep the top
+        Tokenise captions (lowercase + punctuation stripping) and keep the top
         `max_size` words by frequency.
 
-        TODO (Issue #2, deferred): If tokenizer work is assigned, centralize the
+        Future work (Issue #2, deferred): If tokenizer work is assigned, centralize the
         tokenization logic so `build()` and `encode()` use the same tokenizer and
         document how punctuation handling changes vocabulary size and BLEU.
         """
         counter: Counter = Counter()
         for cap in captions:
-            counter.update(cap.lower().split())
+            counter.update(tokenize_caption(cap))
 
         # Reserve indices 0-3 for specials
         specials = [("<pad>", PAD_IDX), ("<start>", START_IDX),
@@ -109,11 +235,11 @@ class Vocabulary:
         Convert a caption string to a list of token ids.
         Prepends START and appends END.
 
-        TODO (Issue #2, deferred): If punctuation normalization is added, keep it
+        Future work (Issue #2, deferred): If punctuation normalization is added, keep it
         identical across train/val/test caption processing and record whether the
         resulting vocab/metric changes are acceptable.
         """
-        tokens = caption.lower().split()
+        tokens = tokenize_caption(caption)
         ids = [START_IDX]
         ids += [self.word2idx.get(t, UNK_IDX) for t in tokens]
         ids += [END_IDX]
@@ -123,7 +249,7 @@ class Vocabulary:
         """
         Convert token ids back to a human-readable string.
 
-        TODO (Issue #2, deferred): If richer decoding is needed, store optional
+        Future work (Issue #2, deferred): If richer decoding is needed, store optional
         original-token metadata so `<unk>` outputs can be surfaced more usefully
         during qualitative inspection without changing training IDs.
         """
@@ -143,16 +269,17 @@ class Vocabulary:
 
     def save(self, path: str) -> None:
         """Save vocab to JSON."""
-        # TODO (Issue #2, deferred): Extend the JSON schema with `max_size`,
+        # Future work (Issue #2, deferred): Extend the JSON schema with `max_size`,
         # tokenizer name, and build metadata so collaborators can audit how a
         # saved vocab was produced.
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w") as f:
             json.dump({"word2idx": self.word2idx}, f)
 
     @classmethod
     def load(cls, path: str) -> "Vocabulary":
         """Load vocab from JSON."""
-        # TODO (Issue #2, deferred): Validate that the vocab JSON contains at
+        # Future work (Issue #2, deferred): Validate that the vocab JSON contains at
         # least `word2idx` and the four special tokens before loading; fail with
         # a clear error if the file was produced by an incompatible schema.
         with open(path) as f:
@@ -200,17 +327,17 @@ class Flickr8kDataset(Dataset):
             Flickr_8k.devImages.txt
             Flickr_8k.testImages.txt
 
-    Each image has 5 reference captions.  During training a random caption is
-    sampled per epoch (paper section 4.3).  During validation/test all 5 are
-    returned as references.
+    Each image has 5 reference captions.  During training each image-caption
+    pair is a sample so length buckets are exact. During validation/test each
+    image is returned once with all 5 references.
 
-    TODO (Issue #3, deferred): If alternate split support is needed, accept a
+    Future work (Issue #3, deferred): If alternate split support is needed, accept a
     Karpathy-style JSON file as an opt-in path while preserving the official
     Flickr8k split files as the default source of truth.
-    TODO (Issue #3): Enforce the proposal split assumptions at dataset creation:
+    Future work (Issue #3): Enforce the proposal split assumptions at dataset creation:
     each split count must match the expected `6000/1000/1000`, and any mismatch
     should raise a dataset-setup error before training begins.
-    TODO (Issue #8, deferred): If dataloader CPU time becomes a bottleneck,
+    Future work (Issue #8, deferred): If dataloader CPU time becomes a bottleneck,
     pre-encode captions once in `__init__` and reuse them in `__getitem__`
     instead of calling `vocab.encode()` every sample.
     """
@@ -220,6 +347,7 @@ class Flickr8kDataset(Dataset):
         data_root: str,
         vocab: Vocabulary,
         split: str = "train",  # "train" | "val" | "test"
+        strict_split_counts: bool = True,
     ):
         assert split in ("train", "val", "test"), f"Unknown split: {split}"
         self.split = split
@@ -227,50 +355,36 @@ class Flickr8kDataset(Dataset):
         self.transform = _TRAIN_TRANSFORM if split == "train" else _EVAL_TRANSFORM
         self.image_dir = os.path.join(data_root, "images")
 
-        # TODO (Issue #3, deferred): If Karpathy JSON support is added, branch
-        # here only when an explicit JSON path is provided; do not silently
-        # change the default split source away from the official files.
-        split_file_map = {
-            "train": "Flickr_8k.trainImages.txt",
-            "val":   "Flickr_8k.devImages.txt",
-            "test":  "Flickr_8k.testImages.txt",
-        }
-        split_path = os.path.join(data_root, split_file_map[split])
-        with open(split_path) as f:
-            split_images = set(line.strip() for line in f)
+        if self.vocab is None:
+            raise ValueError("Flickr8kDataset requires a built Vocabulary.")
 
-        # Parse captions.txt: each line is "image_name#N\tcaption"
-        # Group by image name
-        caps_path = os.path.join(data_root, "captions.txt")
-        image_to_caps: Dict[str, List[str]] = {}
-        # TODO (Issue #3): Support both official tab-delimited lines
-        # (`image.jpg#N<TAB>caption`) and common Kaggle-style CSV lines
-        # (`image.jpg,caption`) with an optional header; normalize both formats
-        # into `image_to_caps[img_name]`.
-        with open(caps_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split("\t", 1)
-                if len(parts) != 2:
-                    continue
-                img_id, caption = parts
-                # Strip the "#N" annotation index suffix
-                img_name = img_id.split("#")[0]
-                if img_name in split_images:
-                    image_to_caps.setdefault(img_name, []).append(caption)
+        image_to_caps = load_flickr8k_captions(
+            data_root,
+            split,
+            strict_split_counts=strict_split_counts,
+        )
 
         self.image_names: List[str] = sorted(image_to_caps.keys())
+        self.image_to_caps = image_to_caps
         self.image_captions: List[List[str]] = [
             image_to_caps[n] for n in self.image_names
         ]
 
-        # TODO (Issue #8, deferred): If dataloader profiling shows repeated
+        # Training uses one image-caption pair per sample so length buckets are
+        # exact. Validation/test remain image-level to preserve the 5 references.
+        self.samples: List[Tuple[str, str]] = []
+        if self.split == "train":
+            for img_name in self.image_names:
+                for caption in self.image_to_caps[img_name]:
+                    self.samples.append((img_name, caption))
+
+        # Future work (Issue #8, deferred): If dataloader profiling shows repeated
         # encoding overhead, pre-tokenize captions here and keep both raw and
         # encoded forms so BLEU references remain untouched.
 
     def __len__(self) -> int:
+        if self.split == "train":
+            return len(self.samples)
         return len(self.image_names)
 
     def __getitem__(self, idx: int):
@@ -281,23 +395,22 @@ class Flickr8kDataset(Dataset):
           caption_len:     scalar long tensor
           all_captions:    list of raw strings for BLEU reference (eval only)
 
-        TODO (Issue #8, deferred): If train-time caption inspection is added,
+        Future work (Issue #8, deferred): If train-time caption inspection is added,
         return the chosen raw caption string alongside the encoded caption so
         debug logging can compare it against the five references for that image.
         """
-        img_name = self.image_names[idx]
+        if self.split == "train":
+            img_name, caption = self.samples[idx]
+            captions = self.image_to_caps[img_name]
+        else:
+            img_name = self.image_names[idx]
+            captions = self.image_captions[idx]
+            # Eval: use first caption for loss; all captions for BLEU.
+            caption = captions[0]
+
         img_path = os.path.join(self.image_dir, img_name)
         image = Image.open(img_path).convert("RGB")
         image = self.transform(image)
-
-        captions = self.image_captions[idx]
-
-        # Training: pick a random caption (paper section 4.3)
-        if self.split == "train":
-            caption = random.choice(captions)
-        else:
-            # Eval: use first caption for loss; all captions for BLEU
-            caption = captions[0]
 
         encoded = self.vocab.encode(caption)
         caption_tensor = torch.tensor(encoded, dtype=torch.long)
@@ -320,7 +433,7 @@ def _collate_fn(batch):
         lengths:  (B,)            — actual lengths
         refs:     list[list[str]] — all reference captions per image
 
-    TODO (Issue #8, deferred): If the decoder is refactored to packed sequences,
+    Future work (Issue #8, deferred): If the decoder is refactored to packed sequences,
     sort `batch` here by descending length and add a test confirming `captions`
     and `lengths` stay aligned after sorting.
     """
@@ -355,47 +468,56 @@ class LengthBucketSampler(Sampler):
     to the corresponding subset of captions. Then, during training we randomly
     sample a length and retrieve a mini-batch of size 64 of that length."
 
-    TODO (Issue #8): Move batch shuffling into `__iter__()` or add a
-    `reshuffle()` hook so every epoch sees a new bucket order instead of
-    reusing the construction-time order for the entire run.
-    TODO (Issue #8, deferred): If bucket sparsity becomes a problem, add an
+    Future work (Issue #8, deferred): If bucket sparsity becomes a problem, add an
     optional tolerance so captions of length `L±1` can share a bucket; verify
     that padding waste does not erase the throughput gain.
     """
 
-    def __init__(self, dataset: Flickr8kDataset, batch_size: int):
+    def __init__(
+        self,
+        dataset: Flickr8kDataset,
+        batch_size: int,
+        drop_last: bool = True,
+    ):
+        if dataset.split != "train":
+            raise ValueError("LengthBucketSampler is intended for the train split only.")
+
         self.batch_size = batch_size
+        self.drop_last = drop_last
 
         # Build length → [indices] mapping.
-        # We read caption lengths from the dataset without loading images by
-        # accessing the pre-built image_captions list directly.
-        # TODO (Issue #8, deferred): Cache encoded caption lengths in the dataset
-        # object so sampler construction no longer re-encodes captions here.
         from collections import defaultdict
         buckets: Dict[int, List[int]] = defaultdict(list)
-        for idx, caps in enumerate(dataset.image_captions):
-            # Use the first caption to determine the bucket length.
-            # All 5 captions for an image have similar length, and we sample
-            # randomly during training anyway.
-            length = len(dataset.vocab.encode(caps[0]))
+        for idx, (_, caption) in enumerate(dataset.samples):
+            length = len(dataset.vocab.encode(caption))
             buckets[length].append(idx)
+        self.buckets = dict(buckets)
 
-        self.batches: List[List[int]] = []
-        for length_key in sorted(buckets.keys()):
-            indices = buckets[length_key]
-            random.shuffle(indices)
-            for start in range(0, len(indices), batch_size):
-                self.batches.append(indices[start : start + batch_size])
-        random.shuffle(self.batches)
+        self._num_batches = 0
+        for indices in self.buckets.values():
+            if self.drop_last:
+                self._num_batches += len(indices) // batch_size
+            else:
+                self._num_batches += (len(indices) + batch_size - 1) // batch_size
 
     def __iter__(self):
-        # Yield complete batches — DataLoader receives a list of indices and
-        # does NOT apply its own batch_size grouping on top.
-        for batch in self.batches:
+        # Reshuffle every epoch. DataLoader calls this once per epoch.
+        batches: List[List[int]] = []
+        for indices in self.buckets.values():
+            indices = indices[:]
+            random.shuffle(indices)
+            for start in range(0, len(indices), self.batch_size):
+                batch = indices[start : start + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                batches.append(batch)
+
+        random.shuffle(batches)
+        for batch in batches:
             yield batch
 
     def __len__(self) -> int:
-        return len(self.batches)
+        return self._num_batches
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +531,8 @@ def get_dataloader(
     batch_size: int = 64,
     num_workers: int = 4,
     use_bucket_sampler: bool = True,
+    strict_split_counts: bool = True,
+    drop_last: bool = True,
 ) -> DataLoader:
     """
     Build a DataLoader for the requested split.
@@ -419,16 +543,21 @@ def get_dataloader(
     shuffle must not be set on the DataLoader directly (PyTorch raises an error
     if you combine batch_sampler with those arguments).
 
-    TODO (Issue #8, deferred): If loader configurability is needed, expose a
+    Future work (Issue #8, deferred): If loader configurability is needed, expose a
     `pin_memory` flag on `get_dataloader()` while keeping the current GPU-friendly
     default enabled for both train and eval.
     """
-    dataset = Flickr8kDataset(data_root, vocab, split)
+    dataset = Flickr8kDataset(
+        data_root,
+        vocab,
+        split,
+        strict_split_counts=strict_split_counts,
+    )
 
     if split == "train" and use_bucket_sampler:
         # LengthBucketSampler yields complete batches → use batch_sampler=.
         # batch_size and shuffle are handled inside the sampler.
-        batch_sampler = LengthBucketSampler(dataset, batch_size)
+        batch_sampler = LengthBucketSampler(dataset, batch_size, drop_last=drop_last)
         return DataLoader(
             dataset,
             batch_sampler=batch_sampler,
