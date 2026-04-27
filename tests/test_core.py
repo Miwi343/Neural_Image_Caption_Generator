@@ -74,14 +74,15 @@ def test_decoder_forward_masks_inactive_attention_and_uses_scalar_beta():
     assert c.max() <= 1.0 and c.min() >= -1.0
 
 
-def test_doubly_stochastic_loss_sums_regions_then_averages_batch():
+def test_doubly_stochastic_loss_averages_over_batch_and_locations():
     alphas = torch.zeros(2, 3, 4)
     alphas[:, :, 0] = 1.0 / 3.0
 
     loss = doubly_stochastic_attention_loss(alphas, weight=1.0)
 
-    # Region 0 sums to 1, the other 3 regions sum to 0 for each sample.
-    assert loss.item() == pytest.approx(3.0)
+    # Location 0 sums to 1 → penalty 0; locations 1-3 sum to 0 → penalty 1 each.
+    # mean over (batch=2, locations=4): (0+1+1+1)*2 / 8 = 0.75
+    assert loss.item() == pytest.approx(0.75)
 
 
 def test_encoder_reshapes_vgg_feature_map(monkeypatch):

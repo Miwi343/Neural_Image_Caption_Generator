@@ -49,6 +49,8 @@ from config import (
     DECODER_DIM,
     DROPOUT,
     EMBED_DIM,
+    ENCODER_FINETUNE_EPOCH,
+    ENCODER_LR,
     GRAD_CLIP,
     LAMBDA,
     MAX_DECODE_LEN,
@@ -77,35 +79,40 @@ from utils.dataset import PAD_IDX
 
 
 def doubly_stochastic_attention_loss(alphas: torch.Tensor, weight: float = LAMBDA):
-    """Eq. 14: lambda * mean_batch(sum_i(1 - sum_t alpha_ti)^2)."""
-    return weight * ((1.0 - alphas.sum(dim=1)) ** 2).sum(dim=1).mean()
+    """Eq. 14: lambda * mean over (batch, locations) of (1 - sum_t alpha_ti)^2.
+    Using .mean() over locations keeps this term on the same scale as CE loss.
+    The original .sum(dim=1) over 196 locations inflated it ~196× and drowned
+    the CE gradient signal.
+    """
+    return weight * ((1.0 - alphas.sum(dim=1)) ** 2).mean()
 
 
-def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoch):
+def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoch,
+                fine_tune_encoder=False):
     """
     Run one training epoch.
 
     Loss = cross-entropy + λ * doubly stochastic regularisation (Eq. 14).
 
     Args:
-        encoder:    Encoder (frozen)
-        decoder:    Decoder (trained)
-        dataloader: training DataLoader
-        optimizer:  Adam on decoder params
-        criterion:  CrossEntropyLoss(ignore_index=PAD_IDX)
-        device:     torch.device
-        epoch:      current epoch number (for logging)
+        encoder:           Encoder (frozen until fine_tune_encoder=True)
+        decoder:           Decoder (always trained)
+        dataloader:        training DataLoader
+        optimizer:         Adam covering decoder (and encoder when fine-tuning)
+        criterion:         CrossEntropyLoss(ignore_index=PAD_IDX)
+        device:            torch.device
+        epoch:             current epoch number (for logging)
+        fine_tune_encoder: when True, encoder runs in train mode and gradients
+                           are computed through it; param group must already be
+                           added to optimizer before calling this.
 
     Returns:
         avg_loss: float
-
-    Future work (Issue #7, deferred): If extra training diagnostics are useful, compute
-    top-5 next-word accuracy from `predictions` vs `targets` and report it
-    alongside loss without affecting optimisation.
-    Future work (Issue #9, deferred): If TensorBoard/W&B logging is enabled, emit
-    per-step and per-epoch loss here using stable metric names.
     """
-    encoder.eval()   # encoder stays frozen — no batch norm updates needed
+    if fine_tune_encoder:
+        encoder.train()
+    else:
+        encoder.eval()
     decoder.train()
 
     total_loss = 0.0
@@ -117,9 +124,13 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
         captions = captions.to(device)
         lengths  = lengths.to(device)
 
-        # Encode: (batch, 196, 512)
-        with torch.no_grad():
+        # Encode: (batch, 196, 512).  Skip no_grad when fine-tuning so
+        # gradients flow through the unfrozen encoder layers.
+        if fine_tune_encoder:
             encoder_out = encoder(images)
+        else:
+            with torch.no_grad():
+                encoder_out = encoder(images)
 
         # Decode: predictions (batch, max_len-1, vocab_size)
         #         alphas      (batch, max_len-1, 196)
@@ -257,30 +268,47 @@ def main():
         dropout=DROPOUT,
     ).to(device)
 
-    # Optimise only the decoder (encoder is frozen)
-    # Future work (Issue #7, deferred): If encoder fine-tuning is enabled later,
-    # introduce a second optimizer param group with a lower LR after the chosen
-    # warm-up epoch and document the schedule clearly.
+    # Decoder optimizer — encoder params are added as a second group when
+    # fine-tuning starts so each group keeps its own LR.
     optimizer = Adam(decoder.parameters(), lr=LEARNING_RATE)
+
+    # Reduce LR by half when BLEU-4 stops improving for 3 epochs.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3
+    )
 
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
     best_bleu4 = 0.0
     best_scores = None
     epochs_no_improve = 0
+    fine_tune_encoder = False
     log_path = os.path.join(RESULTS_DIR, "training_log.csv")
     with open(log_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "val_bleu1", "val_bleu2", "val_bleu3", "val_bleu4", "seconds"])
 
     for epoch in range(1, NUM_EPOCHS + 1):
+
+        # Enable encoder fine-tuning after warmup and add its params to optimizer.
+        if epoch == ENCODER_FINETUNE_EPOCH + 1 and not fine_tune_encoder:
+            encoder._enable_fine_tune()
+            optimizer.add_param_group({
+                "params": [p for p in encoder.parameters() if p.requires_grad],
+                "lr": ENCODER_LR,
+            })
+            fine_tune_encoder = True
+            print(f"Epoch {epoch}: encoder fine-tuning enabled (LR={ENCODER_LR})")
+
         t0 = time.time()
         train_loss = train_epoch(
-            encoder, decoder, train_loader, optimizer, criterion, device, epoch
+            encoder, decoder, train_loader, optimizer, criterion, device, epoch,
+            fine_tune_encoder=fine_tune_encoder,
         )
         val_scores = validate(encoder, decoder, val_loader, vocab, device)
         val_bleu4 = val_scores["bleu4"]
         elapsed = time.time() - t0
+        scheduler.step(val_bleu4)
 
         print(
             f"Epoch {epoch:3d} | loss {train_loss:.4f} | "
