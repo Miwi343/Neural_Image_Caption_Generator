@@ -32,8 +32,9 @@ SPLIT_FILES = [
     "Flickr_8k.testImages.txt",
 ]
 
-# Standard Flickr8k split sizes
-SPLIT_SIZES = (6000, 1000, 1000)
+# Val and test are fixed at 1000 each; training gets ALL remaining images.
+N_VAL  = 1000
+N_TEST = 1000
 
 
 def run(cmd, cwd=None):
@@ -113,12 +114,10 @@ def generate_split_files(data_root: Path) -> bool:
     rng.shuffle(shuffled)
 
     n = len(shuffled)
-    if n >= sum(SPLIT_SIZES):
-        n_train, n_val, n_test = SPLIT_SIZES
-    else:
-        n_train = int(n * 0.75)
-        n_val = int(n * 0.125)
-        n_test = n - n_train - n_val
+    # Reserve fixed val/test pools; every remaining image goes to training.
+    n_val   = min(N_VAL,  max(1, n // 8))
+    n_test  = min(N_TEST, max(1, n // 8))
+    n_train = n - n_val - n_test
 
     splits = [
         ("Flickr_8k.trainImages.txt", shuffled[:n_train]),
@@ -199,17 +198,20 @@ def normalize_flickr8k(source_dir: Path, data_root: Path, use_symlink: bool = Tr
             copy_or_link(src, data_root / filename, use_symlink=use_symlink)
 
     missing_splits = [f for f in SPLIT_FILES if not (data_root / f).exists()]
+    splits_generated = False
     if missing_splits:
         print(
             "Split files not found in source directory — generating from captions.txt:\n  "
             + "\n  ".join(missing_splits)
         )
         generate_split_files(data_root)
+        splits_generated = True
 
     print(f"\nFlickr8k is ready at {data_root}")
     print("Contents:")
     for child in sorted(data_root.iterdir()):
         print(" ", child)
+    return splits_generated
 
 
 def download_from_kaggle(dataset: str, download_dir: Path):
@@ -262,8 +264,9 @@ def main():
     else:
         source_dir = data_root
 
-    normalize_flickr8k(source_dir, data_root, use_symlink=not args.copy)
-    validate(data_root, strict=not args.no_strict)
+    splits_generated = normalize_flickr8k(source_dir, data_root, use_symlink=not args.copy)
+    # Skip strict count check when we auto-generated splits (training size differs from 6000).
+    validate(data_root, strict=not (args.no_strict or splits_generated))
 
 
 if __name__ == "__main__":

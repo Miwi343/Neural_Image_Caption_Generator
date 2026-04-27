@@ -241,9 +241,11 @@ def main():
         print(f"Vocabulary size: {len(vocab)}")
 
     # Dataloaders
-    train_loader = get_dataloader(DATA_ROOT, vocab, "train", BATCH_SIZE)
+    num_workers = min(4, os.cpu_count() or 1)
+    train_loader = get_dataloader(DATA_ROOT, vocab, "train", BATCH_SIZE,
+                                  num_workers=num_workers)
     val_loader   = get_dataloader(DATA_ROOT, vocab, "val",   BATCH_SIZE,
-                                  use_bucket_sampler=False)
+                                  num_workers=num_workers, use_bucket_sampler=False)
 
     # Models
     encoder = Encoder(fine_tune=False).to(device)
