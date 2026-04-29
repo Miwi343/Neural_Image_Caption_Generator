@@ -7,13 +7,19 @@ from utils.dataset import (
     validate_dataset_layout,
 )
 from utils.metrics import compute_bleu, print_bleu_table
-from utils.decoding import beam_search_decode, greedy_decode, greedy_decode_from_encoder_out
+from utils.decoding import (
+    beam_search_decode,
+    greedy_decode,
+    greedy_decode_from_encoder_out,
+    greedy_decode_from_encoder_out_adaptive,
+)
 
 __all__ = [
     "beam_search_decode",
     "Flickr8kDataset",
     "greedy_decode",
     "greedy_decode_from_encoder_out",
+    "greedy_decode_from_encoder_out_adaptive",
     "Vocabulary",
     "get_dataloader",
     "load_flickr8k_captions",

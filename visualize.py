@@ -29,7 +29,13 @@ from torchvision import transforms
 
 from config import ATTENTION_DIM, DECODER_DIM, EMBED_DIM, MAX_DECODE_LEN
 from models import Encoder, Decoder
-from utils import Vocabulary, greedy_decode, load_flickr8k_captions
+from models.adaptive_decoder import AdaptiveDecoder
+from utils import (
+    Vocabulary,
+    greedy_decode,
+    greedy_decode_from_encoder_out_adaptive,
+    load_flickr8k_captions,
+)
 
 # ---------------------------------------------------------------------------
 # ImageNet inverse transform for display
@@ -58,9 +64,10 @@ def _unnormalize(tensor: torch.Tensor) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def visualize_attention(
-    image_tensor: torch.Tensor,     # (3, 224, 224) normalised
+    image_tensor: torch.Tensor,                   # (3, 224, 224) normalised
     caption_words: List[str],
-    alphas: torch.Tensor,           # (num_steps, 196)
+    alphas: torch.Tensor,                         # (num_steps, 196)
+    betas: Optional[torch.Tensor] = None,         # (num_steps,) sentinel weights, or None
     save_path: Optional[str] = None,
     show: bool = False,
     title: str = "",
@@ -75,10 +82,12 @@ def visualize_attention(
         image_tensor:  (3, 224, 224) — ImageNet-normalised input image
         caption_words: list of generated words (excluding <start>/<end>)
         alphas:        (num_steps, 196) — one row per generated word
+        betas:         (num_steps,) sentinel weights from AdaptiveDecoder, or None.
+                       When provided, each subplot title shows "word\nβ=0.xx" so
+                       you can see which words relied on the sentinel vs. the image.
         save_path:     if provided, save figure to this path (PNG/PDF)
         show:          if True, call plt.show() (requires a display)
         title:         optional figure suptitle
-
         dpi:           output DPI
         sigma:         Gaussian blur strength after upsampling
         overlay_style: "paper" for grayscale/white highlight or "heatmap"
@@ -138,7 +147,8 @@ def visualize_attention(
                 extent=[0, 224, 224, 0],
             )
 
-        ax.set_title(word, fontsize=10)
+        word_title = word if betas is None else f"{word}\nβ={float(betas[t]):.2f}"
+        ax.set_title(word_title, fontsize=10)
         ax.axis("off")
 
     # Hide unused axes
@@ -190,8 +200,15 @@ def run_visualization(
     vocab = Vocabulary.load(vocab_path)
     ckpt  = torch.load(checkpoint_path, map_location=device)
 
+    # Auto-detect decoder class from checkpoint
+    model_type   = ckpt.get("model_type", "base")
+    is_adaptive  = (model_type == "adaptive")
+    DecoderClass = AdaptiveDecoder if is_adaptive else Decoder
+    if is_adaptive:
+        print("Detected adaptive-attention checkpoint — sentinel weights (β) will be shown.")
+
     encoder = Encoder(fine_tune=False).to(device)
-    decoder = Decoder(
+    decoder = DecoderClass(
         attention_dim=ATTENTION_DIM,
         embed_dim=EMBED_DIM,
         decoder_dim=DECODER_DIM,
@@ -212,14 +229,19 @@ def run_visualization(
         img_tensor = _EVAL_TRANSFORM(pil_img)           # (3, 224, 224) normalised
         img_batch  = img_tensor.unsqueeze(0).to(device)  # (1, 3, 224, 224)
 
-        caption, alphas, token_ids = greedy_decode(
-            encoder,
-            decoder,
-            img_batch,
-            vocab,
-            device,
-            max_len=MAX_DECODE_LEN,
-        )
+        # Use the adaptive decode path when the model has a sentinel
+        betas = None
+        if is_adaptive:
+            with torch.no_grad():
+                encoder_out = encoder(img_batch)
+            caption, alphas, betas, token_ids = greedy_decode_from_encoder_out_adaptive(
+                decoder, encoder_out, vocab, device, max_len=MAX_DECODE_LEN,
+            )
+        else:
+            caption, alphas, token_ids = greedy_decode(
+                encoder, decoder, img_batch, vocab, device, max_len=MAX_DECODE_LEN,
+            )
+
         words = [vocab.idx2word.get(idx, "<unk>") for idx in token_ids]
         print(f"  Caption: {caption}")
 
@@ -229,6 +251,7 @@ def run_visualization(
             img_tensor.cpu(),
             words,
             alphas,
+            betas=betas,
             save_path=save_path,
             show=False,
             title=caption,

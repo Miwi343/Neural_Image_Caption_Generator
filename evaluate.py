@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from config import ATTENTION_DIM, DECODER_DIM, EMBED_DIM, MAX_DECODE_LEN
 from models import Decoder, Encoder
+from models.adaptive_decoder import AdaptiveDecoder
 from utils import (
     Vocabulary,
     beam_search_decode,
@@ -40,7 +41,12 @@ def evaluate_test_set(
     ckpt = torch.load(checkpoint_path, map_location=device)
 
     encoder = Encoder(fine_tune=False).to(device)
-    decoder = Decoder(
+    # Auto-detect model type from checkpoint so the correct decoder class is used
+    model_type = ckpt.get("model_type", "base")
+    DecoderClass = AdaptiveDecoder if model_type == "adaptive" else Decoder
+    if model_type == "adaptive":
+        print("Detected adaptive-attention checkpoint — using AdaptiveDecoder.")
+    decoder = DecoderClass(
         attention_dim=ATTENTION_DIM,
         embed_dim=EMBED_DIM,
         decoder_dim=DECODER_DIM,

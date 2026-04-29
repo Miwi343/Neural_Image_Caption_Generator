@@ -8,6 +8,68 @@ from utils.dataset import END_IDX, START_IDX
 
 
 @torch.no_grad()
+def greedy_decode_from_encoder_out_adaptive(
+    decoder,
+    encoder_out: torch.Tensor,
+    vocab,
+    device: torch.device,
+    max_len: int = 50,
+) -> Tuple[str, torch.Tensor, torch.Tensor, List[int]]:
+    """
+    Greedy decode with an AdaptiveDecoder, also returning per-step sentinel weights.
+
+    Identical to greedy_decode_from_encoder_out except it also collects the
+    beta (sentinel weight) returned by AdaptiveDecoder.decode_step().
+
+    Args:
+        decoder:     AdaptiveDecoder instance
+        encoder_out: (1, L, encoder_dim) precomputed annotation vectors
+        vocab:       Vocabulary for decoding token ids
+        device:      torch.device
+        max_len:     maximum generation length
+
+    Returns:
+        caption:       generated caption string (no special tokens)
+        alphas:        (T, L)  visual attention weights per step
+        betas:         (T,)    sentinel weights per step
+        generated_ids: list of token ids
+    """
+    decoder.eval()
+    encoder_out = encoder_out.to(device)
+    h, c = decoder._init_hidden(encoder_out)
+
+    word_idx      = torch.tensor([START_IDX], dtype=torch.long, device=device)
+    generated_ids: List[int] = []
+    attention_maps = []
+    beta_values    = []
+
+    for _ in range(max_len):
+        logits, h, c, alpha, beta = decoder.decode_step(encoder_out, word_idx, h, c)
+        word_idx = logits.argmax(dim=1)
+        idx = int(word_idx.item())
+
+        if idx == END_IDX:
+            break
+
+        generated_ids.append(idx)
+        attention_maps.append(alpha.squeeze(0).detach().cpu())  # (L,)
+        beta_values.append(beta.detach().cpu())                 # (1,)
+
+    alphas = (
+        torch.stack(attention_maps, dim=0)
+        if attention_maps
+        else torch.empty(0, encoder_out.size(1))
+    )
+    betas = (
+        torch.cat(beta_values, dim=0)   # (T,)
+        if beta_values
+        else torch.empty(0)
+    )
+
+    return vocab.decode(generated_ids), alphas, betas, generated_ids
+
+
+@torch.no_grad()
 def greedy_decode_from_encoder_out(
     decoder,
     encoder_out: torch.Tensor,
