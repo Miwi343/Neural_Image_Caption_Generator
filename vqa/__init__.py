@@ -1,0 +1,1 @@
+"""VQA yes/no module."""
