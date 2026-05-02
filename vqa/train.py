@@ -178,7 +178,7 @@ def main():
         if p.requires_grad and not name.startswith("encoder.")
     ]
     optimizer = torch.optim.Adam(decoder_params, lr=LEARNING_RATE)
-    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
     criterion = nn.BCEWithLogitsLoss()
 
     # --- Training loop ---
