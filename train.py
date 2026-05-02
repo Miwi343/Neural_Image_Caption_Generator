@@ -378,9 +378,7 @@ if __name__ == "__main__":
                         help=f"Epoch to start encoder fine-tuning (default: {ENCODER_FINETUNE_EPOCH})")
     args = parser.parse_args()
 
-    # Rebind the module-level names that main() and train_epoch() read.
-    # No `global` needed — this block is already at module scope.
-    LAMBDA = args.lambda_weight  # noqa: F811
-    ENCODER_FINETUNE_EPOCH = args.finetune_epoch  # noqa: F811
+    LAMBDA = args.lambda_weight
+    ENCODER_FINETUNE_EPOCH = args.finetune_epoch
 
     main()
