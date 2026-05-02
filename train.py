@@ -370,4 +370,17 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Train Show, Attend and Tell")
+    parser.add_argument("--lambda_weight", type=float, default=LAMBDA,
+                        help=f"Doubly stochastic attention regularisation weight (default: {LAMBDA})")
+    parser.add_argument("--finetune_epoch", type=int, default=ENCODER_FINETUNE_EPOCH,
+                        help=f"Epoch to start encoder fine-tuning (default: {ENCODER_FINETUNE_EPOCH})")
+    args = parser.parse_args()
+
+    # Rebind the module-level names that main() and train_epoch() read.
+    # No `global` needed — this block is already at module scope.
+    LAMBDA = args.lambda_weight  # noqa: F811
+    ENCODER_FINETUNE_EPOCH = args.finetune_epoch  # noqa: F811
+
     main()

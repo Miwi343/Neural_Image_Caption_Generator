@@ -4,7 +4,9 @@ import argparse
 import json
 import os
 
+import nltk
 import torch
+from nltk.translate.meteor_score import meteor_score as nltk_meteor
 from tqdm import tqdm
 
 from config import ATTENTION_DIM, DECODER_DIM, EMBED_DIM, MAX_DECODE_LEN
@@ -27,10 +29,12 @@ def evaluate_test_set(
     vocab_path: str,
     split: str = "test",
     beam_width: int = 1,
+    length_normalize: bool = False,
     batch_size: int = 1,
     results_out: str = "results/test_bleu.json",
 ):
-    """Load a checkpoint, generate captions, print BLEU-1..4, and save JSON."""
+    """Load a checkpoint, generate captions, print BLEU-1..4 + METEOR, and save JSON."""
+    nltk.download("wordnet", quiet=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Loading vocabulary from {vocab_path}...")
@@ -80,14 +84,22 @@ def evaluate_test_set(
                     device,
                     beam_width=beam_width,
                     max_len=MAX_DECODE_LEN,
+                    length_normalize=length_normalize,
                 )
 
             hypotheses.append(caption.split())
             references.append([tokenize_caption(c) for c in all_caps[i]])
 
     scores = compute_bleu(hypotheses, references)
-    model_label = f"Our Soft-Attention (beam={beam_width})"
+
+    meteor = sum(
+        nltk_meteor(refs, hyp) for hyp, refs in zip(hypotheses, references)
+    ) / max(len(hypotheses), 1)
+    scores["meteor"] = meteor
+
+    model_label = f"Our Soft-Attention (beam={beam_width}, len_norm={length_normalize})"
     print_bleu_table(model_label, scores, dataset=split.capitalize())
+    print(f"  METEOR: {meteor * 100:.2f}")
 
     if results_out:
         os.makedirs(os.path.dirname(results_out) or ".", exist_ok=True)
@@ -97,6 +109,7 @@ def evaluate_test_set(
                     "checkpoint": checkpoint_path,
                     "split": split,
                     "beam_width": beam_width,
+                    "length_normalize": length_normalize,
                     "scores": scores,
                 },
                 f,
@@ -114,6 +127,7 @@ if __name__ == "__main__":
     parser.add_argument("--vocab", default="data/flickr8k/vocab.json")
     parser.add_argument("--split", default="test", choices=["val", "test"])
     parser.add_argument("--beam_width", type=int, default=1)
+    parser.add_argument("--length_normalize", action="store_true", default=False)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--results_out", default="results/test_bleu.json")
     args = parser.parse_args()
@@ -124,6 +138,7 @@ if __name__ == "__main__":
         vocab_path=args.vocab,
         split=args.split,
         beam_width=args.beam_width,
+        length_normalize=args.length_normalize,
         batch_size=args.batch_size,
         results_out=args.results_out,
     )
