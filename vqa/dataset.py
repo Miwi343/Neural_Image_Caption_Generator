@@ -253,7 +253,7 @@ def get_vqa_dataloader(
     vocab: QuestionVocabulary,
     split: str,
     batch_size: int = 64,
-    num_workers: int = 4,
+    num_workers: int = 2,
     max_question_len: int = 20,
     max_samples: Optional[int] = None,
 ) -> DataLoader:
