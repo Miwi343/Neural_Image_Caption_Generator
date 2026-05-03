@@ -18,6 +18,7 @@ import os
 import time
 
 import torch
+from tqdm import tqdm
 import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -75,7 +76,8 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, fine_tune_en
     correct = 0
     total = 0
 
-    for images, questions, q_lens, labels in loader:
+    pbar = tqdm(loader, desc=f"Epoch {epoch} train", leave=False)
+    for images, questions, q_lens, labels in pbar:
         images    = images.to(device)
         questions = questions.to(device)
         q_lens    = q_lens.to(device)
@@ -99,6 +101,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, fine_tune_en
         preds   = (torch.sigmoid(logits) >= 0.5).float()
         correct += (preds == labels).sum().item()
         total   += images.size(0)
+        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{correct/total:.4f}")
 
     return total_loss / total, correct / total
 
@@ -110,7 +113,7 @@ def validate(model, loader, criterion, device):
     correct = 0
     total = 0
 
-    for images, questions, q_lens, labels in loader:
+    for images, questions, q_lens, labels in tqdm(loader, desc="Val", leave=False):
         images    = images.to(device)
         questions = questions.to(device)
         q_lens    = q_lens.to(device)
