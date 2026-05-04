@@ -1,261 +1,413 @@
 """
 Ablation experiment runner for Show, Attend and Tell.
 
-Defines six experiments. By default this script only *prints* the commands
-so you can review and run them manually. Pass --run to actually execute them,
-or --smoke to run a 1-batch sanity check for each configuration without full
-training.
+Trains every ablation variant from scratch, then evaluates each with the full
+beam-width × length-normalisation sweep so results are directly comparable.
 
-Usage:
-    # Print all commands (dry run)
+Usage
+-----
+    # Print the full plan (no training, no side effects)
     python scripts/run_ablations.py
 
-    # Run smoke tests for every config (fast, no GPU needed)
+    # Run all experiments sequentially (Colab / GPU server)
+    python scripts/run_ablations.py --run
+
+    # Resume — skip any experiment whose best.pt already exists
+    python scripts/run_ablations.py --run --resume
+
+    # Run only specific experiments by name
+    python scripts/run_ablations.py --run --only no_beta_gate feature_grid_7x7
+
+    # Smoke-test every config (fast, CPU-ok, no full training)
     python scripts/run_ablations.py --smoke
 
-    # Execute all full training runs sequentially (expensive)
-    python scripts/run_ablations.py --run
+    # Print a results table from whatever has already been evaluated
+    python scripts/run_ablations.py --summary
+
+Outputs (per experiment)
+------------------------
+    results/ablation_results/<name>/config.json
+    results/ablation_results/<name>/training_log.csv
+    results/ablation_results/<name>/checkpoints/best.pt
+    results/ablation_results/<name>/checkpoints/epoch_NNN.pt
+    results/ablation_results/<name>/eval_beam<N>_ln<bool>.json   (x5 per model)
 
 Experiments
 -----------
-a) baseline_soft_attention       — paper's exact soft attention (default flags)
-b) no_attention_mean             — static mean-pooled context, no attention MLP
-c) no_doubly_stochastic_lambda_0 — disable doubly stochastic regularisation
-d) no_beta_gate                  — force β = 1, remove scalar context gate
-e) feature_grid_7x7              — 7×7 feature map (L=49) instead of 14×14 (L=196)
+Architectural (require different model weights — cannot be applied to baseline):
+  no_attention       — mean-pooled static context, no spatial attention MLP
+  no_beta_gate       — β forced to 1 (removes learned scalar context gate)
+  feature_grid_7x7   — 7×7 feature maps (L=49) instead of 14×14 (L=196)
 
-All outputs go to results/ablation_results/<experiment_name>/ so results are isolated.
-Each run saves:
-    results/ablation_results/<name>/config.json          — training args
-    results/ablation_results/<name>/training_log.csv     — per-epoch BLEU + loss
-    results/ablation_results/<name>/checkpoints/best.pt  — best checkpoint by BLEU-4
-    results/ablation_results/<name>/test_bleu.json       — held-out test metrics
+Regularisation:
+  lambda_0           — λ=0, doubly stochastic regularisation fully disabled
+  lambda_0_5         — λ=0.5, softer regularisation than paper default (1.0)
+  lambda_2_0         — λ=2.0, stronger regularisation than paper default
+
+Encoder fine-tuning schedule:
+  finetune_ep3       — unlock encoder after epoch 3 (earlier than default 5)
+  finetune_ep10      — unlock encoder after epoch 10 (later than default 5)
+
+Combined:
+  lambda_0_5_finetune3 — λ=0.5 + encoder unlock at epoch 3
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Experiment definitions
+# Experiment registry
 # ---------------------------------------------------------------------------
 
-BASE_OUT = "results/ablation_results"
+BASE_OUT   = "results/ablation_results"
+DATA_ROOT  = "data/flickr8k"          # overridden by --data_root
+VOCAB_PATH = "data/flickr8k/vocab.json"  # overridden by --vocab
+
+EVAL_SWEEP = [
+    # (tag_suffix,          extra_eval_flags)
+    ("beam1_lnFalse",  []),
+    ("beam3_lnFalse",  ["--beam_width", "3"]),
+    ("beam5_lnFalse",  ["--beam_width", "5"]),
+    ("beam3_lnTrue",   ["--beam_width", "3", "--length_normalize"]),
+    ("beam5_lnTrue",   ["--beam_width", "5", "--length_normalize"]),
+]
+
+# Paper Flickr8k soft-attention numbers for comparison
+PAPER = {"bleu1": 67.0, "bleu2": 44.8, "bleu3": 29.9, "bleu4": 19.5, "meteor": 18.93}
 
 EXPERIMENTS = [
+    # ── Architectural ────────────────────────────────────────────────────────
     {
-        "name": "baseline_soft_attention",
-        "description": "Paper's soft attention with all defaults (Xu et al. 2015).",
-        "train_flags": [],
-        "eval_flags": [],
-    },
-    {
-        "name": "no_attention_mean",
-        "description": (
-            "Replace dynamic attention context with static mean-pooled image "
-            "feature. Tests whether any form of attention (vs. mean pooling) matters."
-        ),
+        "name": "no_attention",
+        "description": "Mean-pooled static context; no spatial attention MLP (attention_mode=none).",
+        "group": "architectural",
         "train_flags": ["--attention_mode", "none"],
-        "eval_flags": ["--attention_mode", "none"],
-    },
-    {
-        "name": "no_doubly_stochastic_lambda_0",
-        "description": (
-            "Set λ=0 to fully disable the doubly stochastic attention "
-            "regularisation penalty (Eq. 14)."
-        ),
-        "train_flags": ["--lambda_weight", "0.0"],
-        "eval_flags": [],
+        "eval_flags":  ["--attention_mode", "none"],
     },
     {
         "name": "no_beta_gate",
-        "description": (
-            "Force β_t = 1 at every step, removing the learned scalar context "
-            "gate (paper section 4.2.1)."
-        ),
+        "description": "Force β=1 at every step; removes learned scalar context gate (section 4.2.1).",
+        "group": "architectural",
         "train_flags": ["--no_beta_gate"],
-        "eval_flags": ["--no_beta_gate"],
+        "eval_flags":  ["--no_beta_gate"],
     },
     {
         "name": "feature_grid_7x7",
-        "description": (
-            "Use 7×7 visual feature maps (L=49) instead of the paper's 14×14 "
-            "(L=196) via adaptive average pooling."
-        ),
+        "description": "7×7 feature maps (L=49) instead of 14×14 (L=196) via adaptive avg pooling.",
+        "group": "architectural",
         "train_flags": ["--feature_grid_size", "7"],
-        "eval_flags": ["--feature_grid_size", "7"],
+        "eval_flags":  ["--feature_grid_size", "7"],
+    },
+    # ── Regularisation ───────────────────────────────────────────────────────
+    {
+        "name": "lambda_0",
+        "description": "λ=0: doubly stochastic attention regularisation fully disabled.",
+        "group": "regularisation",
+        "train_flags": ["--lambda_weight", "0.0"],
+        "eval_flags":  [],
+    },
+    {
+        "name": "lambda_0_5",
+        "description": "λ=0.5: softer doubly stochastic regularisation (half of paper default).",
+        "group": "regularisation",
+        "train_flags": ["--lambda_weight", "0.5"],
+        "eval_flags":  [],
+    },
+    {
+        "name": "lambda_2_0",
+        "description": "λ=2.0: stronger doubly stochastic regularisation (double paper default).",
+        "group": "regularisation",
+        "train_flags": ["--lambda_weight", "2.0"],
+        "eval_flags":  [],
+    },
+    # ── Encoder fine-tuning schedule ─────────────────────────────────────────
+    {
+        "name": "finetune_ep3",
+        "description": "Unlock encoder fine-tuning after epoch 3 (earlier than default 5).",
+        "group": "finetune_schedule",
+        "train_flags": ["--finetune_epoch", "3"],
+        "eval_flags":  [],
+    },
+    {
+        "name": "finetune_ep10",
+        "description": "Unlock encoder fine-tuning after epoch 10 (later than default 5).",
+        "group": "finetune_schedule",
+        "train_flags": ["--finetune_epoch", "10"],
+        "eval_flags":  [],
+    },
+    # ── Combined ─────────────────────────────────────────────────────────────
+    {
+        "name": "lambda_0_5_finetune3",
+        "description": "λ=0.5 combined with early encoder unlock at epoch 3.",
+        "group": "combined",
+        "train_flags": ["--lambda_weight", "0.5", "--finetune_epoch", "3"],
+        "eval_flags":  [],
     },
 ]
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def exp_dir(name: str) -> Path:
+    return Path(BASE_OUT) / name
+
+def ckpt_dir(name: str) -> Path:
+    return exp_dir(name) / "checkpoints"
+
+def best_ckpt(name: str) -> Path:
+    return ckpt_dir(name) / "best.pt"
+
+def eval_out(name: str, sweep_tag: str) -> Path:
+    return exp_dir(name) / f"eval_{sweep_tag}.json"
 
 
 # ---------------------------------------------------------------------------
 # Command builders
 # ---------------------------------------------------------------------------
 
-def _out(name: str) -> str:
-    return os.path.join(BASE_OUT, name)
-
-
-def _train_cmd(exp: dict) -> list:
-    name = exp["name"]
-    out = _out(name)
+def train_cmd(exp: dict) -> list:
     return (
         [sys.executable, "train.py"]
         + exp["train_flags"]
-        + ["--checkpoint_dir", os.path.join(out, "checkpoints")]
-        + ["--results_dir", out]
+        + ["--data_root",      DATA_ROOT]
+        + ["--vocab",          VOCAB_PATH]
+        + ["--checkpoint_dir", str(ckpt_dir(exp["name"]))]
+        + ["--results_dir",    str(exp_dir(exp["name"]))]
     )
 
-
-def _eval_cmd(exp: dict) -> list:
-    name = exp["name"]
-    out = _out(name)
+def eval_cmd(exp: dict, sweep_tag: str, sweep_extra: list) -> list:
     return (
         [sys.executable, "evaluate.py"]
         + exp["eval_flags"]
-        + ["--checkpoint", os.path.join(out, "checkpoints", "best.pt")]
-        + ["--results_out", os.path.join(out, "test_bleu.json")]
+        + sweep_extra
+        + ["--checkpoint",  str(best_ckpt(exp["name"]))]
+        + ["--data_root",   DATA_ROOT]
+        + ["--vocab",       VOCAB_PATH]
+        + ["--results_out", str(eval_out(exp["name"], sweep_tag))]
+        + ["--batch_size", "64"]
     )
 
 
-def _smoke_cmd(exp: dict) -> list:
+# ---------------------------------------------------------------------------
+# Execution helpers
+# ---------------------------------------------------------------------------
+
+def run(cmd: list, label: str) -> bool:
+    print(f"\n{'─'*60}")
+    print(f"  {label}")
+    print(f"  {' '.join(cmd)}")
+    print(f"{'─'*60}")
+    return subprocess.run(cmd).returncode == 0
+
+
+def run_experiment(exp: dict, resume: bool) -> dict:
+    """Train one experiment then run the full eval sweep. Returns per-sweep scores."""
     name = exp["name"]
-    out = _out(name)
-    return (
-        [sys.executable, "-m", "pytest",
-         "tests/test_ablations.py::test_smoke_forward",
-         "-k", name,
-         "-v", "--tb=short"]
-    )
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _print_plan() -> None:
-    """Print every train + evaluate command without running anything."""
-    print("=" * 72)
-    print("Ablation experiment plan — commands to run manually")
-    print("=" * 72)
-    for exp in EXPERIMENTS:
-        name = exp["name"]
-        print(f"\n{'─' * 60}")
-        print(f"  [{name}]")
-        print(f"  {exp['description']}")
-        print()
-        train_cmd = " ".join(_train_cmd(exp))
-        eval_cmd  = " ".join(_eval_cmd(exp))
-        print(f"  # Train")
-        print(f"  {train_cmd}")
-        print()
-        print(f"  # Evaluate on test split")
-        print(f"  {eval_cmd}")
-        out = _out(name)
-        print()
-        print(f"  # Outputs → {out}/")
-    print(f"\n{'─' * 60}")
-    print(
-        "\nTo execute all runs:\n"
-        "    python scripts/run_ablations.py --run\n"
-        "\nTo run smoke tests only:\n"
-        "    python scripts/run_ablations.py --smoke"
-    )
-
-
-def _run_cmd(cmd: list, label: str) -> bool:
-    print(f"\n>>> {label}")
-    print("    " + " ".join(cmd))
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        print(f"FAILED (exit {result.returncode}): {label}")
-        return False
-    return True
-
-
-def _run_all() -> None:
-    """Run train + evaluate for every experiment sequentially."""
-    failures = []
-    for exp in EXPERIMENTS:
-        name = exp["name"]
-        ok = _run_cmd(_train_cmd(exp), f"Training: {name}")
-        if not ok:
-            failures.append(f"train:{name}")
-            continue
-        ok = _run_cmd(_eval_cmd(exp), f"Evaluating: {name}")
-        if not ok:
-            failures.append(f"eval:{name}")
-
-    if failures:
-        print(f"\nFailed steps: {failures}")
-        sys.exit(1)
+    # ── Training ─────────────────────────────────────────────────────────────
+    if resume and best_ckpt(name).exists():
+        print(f"\n[{name}] best.pt already exists — skipping training (--resume)")
     else:
-        print("\nAll experiments completed successfully.")
+        ok = run(train_cmd(exp), f"TRAIN  {name}")
+        if not ok:
+            print(f"[{name}] training FAILED — skipping eval")
+            return {}
+
+    if not best_ckpt(name).exists():
+        print(f"[{name}] best.pt not found after training — skipping eval")
+        return {}
+
+    # ── Eval sweep ───────────────────────────────────────────────────────────
+    sweep_scores = {}
+    for sweep_tag, sweep_extra in EVAL_SWEEP:
+        out_path = eval_out(name, sweep_tag)
+        if resume and out_path.exists():
+            print(f"[{name}] {sweep_tag} already evaluated — skipping")
+            with open(out_path) as f:
+                sweep_scores[sweep_tag] = json.load(f)["scores"]
+            continue
+
+        ok = run(eval_cmd(exp, sweep_tag, sweep_extra), f"EVAL   {name}  [{sweep_tag}]")
+        if ok and out_path.exists():
+            with open(out_path) as f:
+                sweep_scores[sweep_tag] = json.load(f)["scores"]
+
+    return sweep_scores
 
 
-def _run_smoke() -> None:
-    """Run the lightweight smoke tests for every ablation config."""
-    print("Running smoke tests for all ablation configurations...")
-    cmd = [
-        sys.executable, "-m", "pytest",
-        "tests/test_ablations.py",
-        "-v", "--tb=short",
-    ]
-    result = subprocess.run(cmd)
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+def load_all_results() -> dict:
+    """Load whatever eval JSONs already exist on disk."""
+    results = {}
+    for exp in EXPERIMENTS:
+        name = exp["name"]
+        sweep_scores = {}
+        for sweep_tag, _ in EVAL_SWEEP:
+            p = eval_out(name, sweep_tag)
+            if p.exists():
+                with open(p) as f:
+                    sweep_scores[sweep_tag] = json.load(f)["scores"]
+        if sweep_scores:
+            results[name] = sweep_scores
+    return results
+
+
+def print_summary(results: dict) -> None:
+    if not results:
+        print("No results found. Run with --run first.")
+        return
+
+    metrics = ["bleu1", "bleu2", "bleu3", "bleu4", "meteor"]
+    mnames  = ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR"]
+
+    # Pick the best sweep config (highest BLEU-4) for each experiment
+    def best_sweep(sweep_scores):
+        return max(sweep_scores.items(),
+                   key=lambda kv: kv[1].get("bleu4", 0))
+
+    col_w = 28
+    print("\n" + "=" * 90)
+    print("  ABLATION RESULTS SUMMARY  (best eval config per experiment)")
+    print("=" * 90)
+    print(f"  {'Experiment':<{col_w}}  {'Config':<16}  "
+          + "  ".join(f"{m:>7}" for m in mnames))
+    print("  " + "-" * 86)
+    # Paper baseline
+    print(f"  {'Paper Soft-Att (Table 1)':<{col_w}}  {'—':16}  "
+          + "  ".join(f"{PAPER[k]:>7.1f}" for k in metrics))
+    print("  " + "-" * 86)
+
+    # Group results
+    groups = {}
+    for exp in EXPERIMENTS:
+        g = exp["group"]
+        groups.setdefault(g, []).append(exp["name"])
+
+    for group, names in groups.items():
+        print(f"\n  [{group}]")
+        for name in names:
+            if name not in results:
+                print(f"  {'  ' + name:<{col_w+2}}  {'(not run yet)':16}")
+                continue
+            sweep_tag, scores = best_sweep(results[name])
+            meteor = scores.get("meteor", 0)
+            vals = [scores.get(k, 0)*100 for k in ["bleu1","bleu2","bleu3","bleu4"]]
+            vals.append(meteor*100)
+            row = "  ".join(f"{v:>7.2f}" for v in vals)
+            print(f"  {'  ' + name:<{col_w+2}}  {sweep_tag:<16}  {row}")
+
+    print("\n" + "=" * 90)
+    print("  Full per-sweep breakdowns:")
+    for name, sweep_scores in results.items():
+        exp_obj = next(e for e in EXPERIMENTS if e["name"] == name)
+        print(f"\n  {name}  [{exp_obj['group']}]")
+        print(f"    {'Sweep config':<20}  " + "  ".join(f"{m:>7}" for m in mnames))
+        print("    " + "-" * 68)
+        for sweep_tag, scores in sweep_scores.items():
+            vals = [scores.get(k, 0)*100 for k in ["bleu1","bleu2","bleu3","bleu4"]]
+            vals.append(scores.get("meteor", 0)*100)
+            row = "  ".join(f"{v:>7.2f}" for v in vals)
+            print(f"    {sweep_tag:<20}  {row}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Plan printer
+# ---------------------------------------------------------------------------
+
+def print_plan(only: list) -> None:
+    exps = [e for e in EXPERIMENTS if not only or e["name"] in only]
+    print("=" * 72)
+    print(f"Ablation plan — {len(exps)} experiment(s)")
+    print("=" * 72)
+    for exp in exps:
+        name = exp["name"]
+        print(f"\n  [{name}]  group={exp['group']}")
+        print(f"  {exp['description']}")
+        print(f"\n  Train:  {' '.join(train_cmd(exp))}")
+        for sweep_tag, sweep_extra in EVAL_SWEEP:
+            print(f"  Eval [{sweep_tag}]:  {' '.join(eval_cmd(exp, sweep_tag, sweep_extra))}")
+        print(f"\n  Outputs → {exp_dir(name)}/")
+    print(f"\n{'─'*72}")
+    print("Run with --run to execute, --resume to skip completed experiments.")
+
+
+# ---------------------------------------------------------------------------
+# Smoke tests
+# ---------------------------------------------------------------------------
+
+def run_smoke() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/test_ablations.py", "-v", "--tb=short"]
+    )
     sys.exit(result.returncode)
 
 
 # ---------------------------------------------------------------------------
-# Suggested results table
-# ---------------------------------------------------------------------------
-
-RESULTS_TABLE_TEMPLATE = """
-Suggested results table
-=======================
-
-| Experiment                      | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 | METEOR | Val Loss | Notes                        |
-|---------------------------------|--------|--------|--------|--------|--------|----------|------------------------------|
-| baseline_soft_attention         |        |        |        |        |        |          | Paper target: 67/44.8/29.9/19.5 |
-| no_attention_mean               |        |        |        |        |        |          | Static mean context          |
-| no_doubly_stochastic_lambda_0   |        |        |        |        |        |          | λ=0, no Eq.14 penalty        |
-| no_beta_gate                    |        |        |        |        |        |          | β forced to 1                |
-| feature_grid_7x7                |        |        |        |        |        |          | L=49 instead of 196          |
-
-Fill in from results/ablation_results/<name>/test_bleu.json after each run.
-"""
-
-
-# ---------------------------------------------------------------------------
-# Main
+# Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Ablation experiment runner for Show, Attend and Tell."
+        description="Train and evaluate all Show, Attend and Tell ablation variants."
     )
-    parser.add_argument(
-        "--run",
-        action="store_true",
-        help="Execute all training + evaluation runs sequentially.",
-    )
-    parser.add_argument(
-        "--smoke",
-        action="store_true",
-        help="Run the lightweight smoke tests for each ablation config.",
-    )
-    parser.add_argument(
-        "--table",
-        action="store_true",
-        help="Print the suggested results table template.",
-    )
+    parser.add_argument("--run",       action="store_true",
+                        help="Execute all training + evaluation runs.")
+    parser.add_argument("--resume",    action="store_true",
+                        help="Skip experiments whose best.pt / eval JSONs already exist.")
+    parser.add_argument("--only",      nargs="+", metavar="NAME",
+                        help="Run only the named experiments.")
+    parser.add_argument("--smoke",     action="store_true",
+                        help="Run smoke tests for each ablation config.")
+    parser.add_argument("--summary",   action="store_true",
+                        help="Print results table from existing eval JSONs.")
+    parser.add_argument("--data_root", default=DATA_ROOT,
+                        help=f"Path to flickr8k data root (default: {DATA_ROOT}).")
+    parser.add_argument("--vocab",     default=VOCAB_PATH,
+                        help=f"Path to vocab.json (default: {VOCAB_PATH}).")
     args = parser.parse_args()
 
+    # Push data paths into module-level globals so all cmd builders pick them up
+    global DATA_ROOT, VOCAB_PATH
+    DATA_ROOT  = args.data_root
+    VOCAB_PATH = args.vocab
+
     if args.smoke:
-        _run_smoke()
+        run_smoke()
+
+    elif args.summary:
+        print_summary(load_all_results())
+
     elif args.run:
-        _run_all()
-    elif args.table:
-        print(RESULTS_TABLE_TEMPLATE)
+        exps = [e for e in EXPERIMENTS if not args.only or e["name"] in args.only]
+        print(f"Running {len(exps)} experiment(s)"
+              + (" (resume mode)" if args.resume else "") + "\n")
+
+        all_results = {}
+        failures = []
+        for exp in exps:
+            scores = run_experiment(exp, resume=args.resume)
+            if scores:
+                all_results[exp["name"]] = scores
+            else:
+                failures.append(exp["name"])
+
+        print_summary(all_results)
+
+        if failures:
+            print(f"Failed experiments: {failures}")
+            sys.exit(1)
+        else:
+            print("All experiments completed successfully.")
+
     else:
-        _print_plan()
+        print_plan(args.only or [])

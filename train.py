@@ -225,6 +225,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=ENCODER_FINETUNE_EPOCH,
         help=f"Epoch to start encoder fine-tuning (default: {ENCODER_FINETUNE_EPOCH}).",
     )
+    # --- Data paths ---
+    parser.add_argument(
+        "--data_root",
+        default=DATA_ROOT,
+        help=f"Path to Flickr8k data root (default: {DATA_ROOT}).",
+    )
+    parser.add_argument(
+        "--vocab",
+        default=VOCAB_PATH,
+        help=f"Path to vocab.json (default: {VOCAB_PATH}).",
+    )
     # --- Output dirs ---
     parser.add_argument(
         "--checkpoint_dir",
@@ -282,22 +293,22 @@ def main(args=None):
     print(f"Config saved → {config_path}")
 
     # Build or load vocabulary
-    if os.path.exists(VOCAB_PATH):
+    if os.path.exists(args.vocab):
         print("Loading vocabulary...")
-        vocab = Vocabulary.load(VOCAB_PATH)
+        vocab = Vocabulary.load(args.vocab)
     else:
         print("Building vocabulary...")
-        image_to_caps = load_flickr8k_captions(DATA_ROOT, "train")
+        image_to_caps = load_flickr8k_captions(args.data_root, "train")
         all_captions = [cap for caps in image_to_caps.values() for cap in caps]
         vocab = Vocabulary(max_size=VOCAB_SIZE)
         vocab.build(all_captions)
-        vocab.save(VOCAB_PATH)
+        vocab.save(args.vocab)
         print(f"Vocabulary size: {len(vocab)}")
 
     num_workers = min(4, os.cpu_count() or 1)
-    train_loader = get_dataloader(DATA_ROOT, vocab, "train", BATCH_SIZE,
+    train_loader = get_dataloader(args.data_root, vocab, "train", BATCH_SIZE,
                                   num_workers=num_workers)
-    val_loader   = get_dataloader(DATA_ROOT, vocab, "val",   BATCH_SIZE,
+    val_loader   = get_dataloader(args.data_root, vocab, "val",   BATCH_SIZE,
                                   num_workers=num_workers, use_bucket_sampler=False)
 
     encoder = Encoder(
