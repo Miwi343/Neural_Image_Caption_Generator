@@ -7,7 +7,7 @@ import os
 import torch
 from tqdm import tqdm
 
-from config import ATTENTION_DIM, DECODER_DIM, EMBED_DIM, MAX_DECODE_LEN
+from config import ATTENTION_DIM, DECODER_DIM, DROPOUT, EMBED_DIM, MAX_DECODE_LEN
 from models import Decoder, Encoder
 from utils import (
     Vocabulary,
@@ -45,7 +45,7 @@ def evaluate_test_set(
         embed_dim=EMBED_DIM,
         decoder_dim=DECODER_DIM,
         vocab_size=len(vocab),
-        dropout=0.0,
+        dropout=DROPOUT,
     ).to(device)
 
     encoder.load_state_dict(ckpt["encoder"])

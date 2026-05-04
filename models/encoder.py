@@ -19,41 +19,39 @@ import torchvision.models as models
 
 class Encoder(nn.Module):
     """
-    Wraps a pretrained VGG-16 and exposes a 14x14x512 convolutional feature
+    Wraps a pretrained VGG-19 and exposes a 14x14x512 convolutional feature
     map.
 
-    VGG-16 features layer indices (31 layers total, 0-30):
+    Paper section 5.4: "The 19-layer OxfordNet … with 4 max pooling layers
+    we get an output dimension of the top convolutional layer of 14x14."
+
+    VGG-19 features layer indices (37 layers total, 0-36):
       0-3:   conv1_1, relu, conv1_2, relu
       4:     MaxPool → 112x112
       5-8:   conv2_1, relu, conv2_2, relu
       9:     MaxPool → 56x56
-      10-15: conv3_1, relu, conv3_2, relu, conv3_3, relu
-      16:    MaxPool → 28x28
-      17-22: conv4_1, relu, conv4_2, relu, conv4_3, relu
-      23:    MaxPool → 14x14   ← 4th max-pool; spatial size becomes 14x14
-      24-29: conv5_1, relu, conv5_2, relu, conv5_3, relu
-      30:    MaxPool → 7x7    ← 5th max-pool (NOT included)
+      10-17: conv3_1, relu, conv3_2, relu, conv3_3, relu, conv3_4, relu
+      18:    MaxPool → 28x28
+      19-26: conv4_1, relu, conv4_2, relu, conv4_3, relu, conv4_4, relu
+      27:    MaxPool → 14x14   ← 4th max-pool; spatial size becomes 14x14
+      28-35: conv5_1, relu, conv5_2, relu, conv5_3, relu, conv5_4, relu
+      36:    MaxPool → 7x7    ← 5th max-pool (NOT included)
 
-    features[:30] keeps layers 0-29: through conv5_3+relu, before the 5th
-    max-pool.  Output is (batch, 512, 14, 14) for a 224x224 input, matching
-    the paper's "14×14×512 feature map … before max pooling" (section 4.3).
+    features[:36] keeps layers 0-35: through conv5_4+relu, before the 5th
+    max-pool. Output is (batch, 512, 14, 14) for a 224x224 input.
 
     Output shape: (batch_size, L, D) = (batch_size, 196, 512)
     where L = 14*14 = 196 annotation locations and D = 512 channels.
-
-    Future work (Issue #4, deferred): If fine-tuning is assigned, expose exactly which
-    VGG layers are unfrozen and preserve the current frozen-by-default behavior
-    for the proposal reproduction.
     """
 
     def __init__(self, fine_tune: bool = False):
         super().__init__()
 
-        vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+        vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1)
 
-        # features[:30] → layers 0-29 → output (batch, 512, 14, 14).
-        # Stops after conv5_3+relu, before the 5th max-pool (index 30).
-        self.cnn = nn.Sequential(*list(vgg.features.children())[:30])
+        # features[:36] → layers 0-35 → output (batch, 512, 14, 14).
+        # Stops after conv5_4+relu, before the 5th max-pool (index 36).
+        self.cnn = nn.Sequential(*list(vgg.features.children())[:36])
 
         # Freeze all parameters by default
         for param in self.cnn.parameters():

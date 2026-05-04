@@ -27,7 +27,7 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter
 from torchvision import transforms
 
-from config import ATTENTION_DIM, DECODER_DIM, EMBED_DIM, MAX_DECODE_LEN
+from config import ATTENTION_DIM, DECODER_DIM, DROPOUT, EMBED_DIM, MAX_DECODE_LEN
 from models import Encoder, Decoder
 from utils import Vocabulary, greedy_decode, load_flickr8k_captions
 
@@ -196,7 +196,7 @@ def run_visualization(
         embed_dim=EMBED_DIM,
         decoder_dim=DECODER_DIM,
         vocab_size=len(vocab),
-        dropout=0.0,
+        dropout=DROPOUT,
     ).to(device)
     encoder.load_state_dict(ckpt["encoder"])
     decoder.load_state_dict(ckpt["decoder"])

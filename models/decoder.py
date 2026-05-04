@@ -26,6 +26,24 @@ import torch.nn as nn
 from models.attention import Attention
 
 
+class PaperDropout(nn.Module):
+    """Non-inverted dropout used by the authors' Theano code."""
+
+    def __init__(self, p: float = 0.5):
+        super().__init__()
+        if p < 0.0 or p >= 1.0:
+            raise ValueError("dropout probability must be in [0, 1).")
+        self.p = float(p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.p == 0.0:
+            return x
+        keep_prob = 1.0 - self.p
+        if self.training:
+            return x * torch.empty_like(x).bernoulli_(keep_prob)
+        return x * keep_prob
+
+
 class Decoder(nn.Module):
     """
     One-step-at-a-time LSTM decoder with soft attention.
@@ -71,7 +89,7 @@ class Decoder(nn.Module):
         self.attention = Attention(encoder_dim, decoder_dim, attention_dim)
 
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.dropout = nn.Dropout(p=dropout)
+        self.dropout = PaperDropout(p=dropout)
 
         # LSTMCell input: [embedding || context_vector] = embed_dim + encoder_dim.
         # The previous hidden state is supplied through the recurrent state tuple,
@@ -99,13 +117,30 @@ class Decoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Uniform initialisation for embedding and output layers."""
-        # Future work (Issue #6, deferred): Compare the current uniform init to Xavier
-        # on a short Flickr8k training run and keep the simpler scheme unless
-        # the alternate init improves convergence or BLEU consistently.
-        nn.init.uniform_(self.embedding.weight, -0.1, 0.1)
-        nn.init.uniform_(self.L_o.weight, -0.1, 0.1)
-        nn.init.constant_(self.L_o.bias, 0)
+        """Initialise weights like the authors' Theano implementation."""
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.01)
+
+        linear_layers = [
+            self.attention.encoder_att,
+            self.attention.decoder_att,
+            self.attention.full_att,
+            self.init_h,
+            self.init_c,
+            self.f_beta,
+            self.L_h,
+            self.L_z,
+            self.L_o,
+        ]
+        for layer in linear_layers:
+            nn.init.normal_(layer.weight, mean=0.0, std=0.01)
+            if layer.bias is not None:
+                nn.init.constant_(layer.bias, 0.0)
+
+        nn.init.normal_(self.lstm_cell.weight_ih, mean=0.0, std=0.01)
+        for recurrent_block in self.lstm_cell.weight_hh.chunk(4, dim=0):
+            nn.init.orthogonal_(recurrent_block)
+        nn.init.constant_(self.lstm_cell.bias_ih, 0.0)
+        nn.init.constant_(self.lstm_cell.bias_hh, 0.0)
 
     def _init_hidden(self, encoder_out: torch.Tensor):
         """
