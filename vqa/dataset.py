@@ -206,13 +206,23 @@ class VQAYesNoDataset(Dataset):
         )
         all_pairs = _load_yes_no_pairs(ann_path, q_path)
 
-        # Filter to pairs whose image file is actually present on disk.
-        # The notebook only downloads ~90% of images to save Drive space,
-        # so some image IDs will be missing.
+        # Filter to pairs whose image file is present on disk AND readable by PIL.
+        # Files may exist but be corrupt/truncated from partial downloads.
         coco_split_name = "train" if split == "train" else "val"
+
+        def _is_valid_image(path: str) -> bool:
+            if not os.path.exists(path):
+                return False
+            try:
+                with Image.open(path) as img:
+                    img.verify()
+                return True
+            except Exception:
+                return False
+
         self.pairs = [
             p for p in all_pairs
-            if os.path.exists(_coco_image_path(self.images_dir, coco_split_name, p[0]))
+            if _is_valid_image(_coco_image_path(self.images_dir, coco_split_name, p[0]))
         ]
         if len(self.pairs) < len(all_pairs):
             print(
@@ -234,7 +244,10 @@ class VQAYesNoDataset(Dataset):
         coco_split = "train" if self.split == "train" else "val"
         img_path = _coco_image_path(self.images_dir, coco_split, image_id)
 
-        image = Image.open(img_path).convert("RGB")
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except Exception as e:
+            raise RuntimeError(f"Corrupt image at {img_path}: {e}") from e
         image = self.transform(image)
 
         ids = self.vocab.encode(question_str, max_len=self.max_q)
