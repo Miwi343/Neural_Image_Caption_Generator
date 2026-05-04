@@ -9,30 +9,26 @@ Implements:
   - Per-epoch checkpointing + early stopping on validation BLEU-4
   - Batch length-bucketing for training speed (paper section 4.3)
 
-Key hyperparameters (paper / standard community values):
-  EMBED_DIM      = 512   (word embedding dimension m)
-  DECODER_DIM    = 512   (LSTM hidden size n)
-  ATTENTION_DIM  = 512   (attention MLP hidden size)
-  DROPOUT        = 0.5
-  VOCAB_SIZE     = 10000
-  LAMBDA         = 1.0   (doubly stochastic regularisation weight)
-  GRAD_CLIP      = 5.0
-  BATCH_SIZE     = 64
-  NUM_EPOCHS     = 50
-  PATIENCE       = 5     (early stop if BLEU-4 doesn't improve)
+Ablation flags (all default to the paper's exact behaviour):
+  --attention_mode   soft | none
+  --no_beta_gate     disable the learned β scalar gate (default: enabled)
+  --lambda_weight    doubly stochastic regularisation weight (default: 1.0)
+  --feature_grid_size  14 | 7  (spatial annotation resolution, default: 14)
+  --checkpoint_dir   where to save epoch/best checkpoints
+  --results_dir      where to save training_log.csv and config.json
 
-Future work (Issue #7, deferred): If training stability work is assigned, add
-`ReduceLROnPlateau` keyed on validation BLEU-4 and log exactly when the LR
-changes so runs remain comparable.
-Future work (Issue #8, deferred): If scaling beyond one GPU becomes necessary, wrap the
-model with DDP/DataParallel only after single-GPU training is stable and verify
-that checkpoint loading + BLEU parity still hold on 1 GPU.
-Future work (Issue #9, deferred): If experiment tracking is needed for the report, log
-loss and BLEU curves to TensorBoard or W&B without changing the default CLI-free
-training path.
+Future work (Issue #7, deferred): If training stability work is assigned, log
+exactly when the LR changes so runs remain comparable.
+Future work (Issue #8, deferred): If scaling beyond one GPU becomes necessary,
+wrap the model with DDP/DataParallel only after single-GPU training is stable.
+Future work (Issue #9, deferred): If experiment tracking is needed for the report,
+log loss and BLEU curves to TensorBoard or W&B without changing the default
+CLI-free training path.
 """
 
+import argparse
 import csv
+import json
 import os
 import time
 
@@ -43,6 +39,7 @@ from tqdm import tqdm
 
 from config import (
     ATTENTION_DIM,
+    ATTENTION_MODE,
     BATCH_SIZE,
     CHECKPOINT_DIR,
     DATA_ROOT,
@@ -51,6 +48,7 @@ from config import (
     EMBED_DIM,
     ENCODER_FINETUNE_EPOCH,
     ENCODER_LR,
+    FEATURE_GRID_SIZE,
     GRAD_CLIP,
     LAMBDA,
     MAX_DECODE_LEN,
@@ -58,6 +56,7 @@ from config import (
     NUM_EPOCHS,
     PATIENCE,
     RESULTS_DIR,
+    USE_BETA_GATE,
     VOCAB_PATH,
     VOCAB_SIZE,
 )
@@ -73,10 +72,6 @@ from utils import (
 )
 from utils.dataset import PAD_IDX
 
-# Future work (Issue #7, deferred): If run management gets more complex, replace these
-# module-level constants with argparse flags while keeping the current values as
-# defaults for a drop-in baseline run.
-
 
 def doubly_stochastic_attention_loss(alphas: torch.Tensor, weight: float = LAMBDA):
     """Eq. 14: lambda * mean over (batch, locations) of (1 - sum_t alpha_ti)^2.
@@ -87,27 +82,22 @@ def doubly_stochastic_attention_loss(alphas: torch.Tensor, weight: float = LAMBD
     return weight * ((1.0 - alphas.sum(dim=1)) ** 2).mean()
 
 
-def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoch,
-                fine_tune_encoder=False):
+def train_epoch(
+    encoder,
+    decoder,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    epoch,
+    fine_tune_encoder=False,
+    lambda_weight: float = LAMBDA,
+):
     """
     Run one training epoch.
 
     Loss = cross-entropy + λ * doubly stochastic regularisation (Eq. 14).
-
-    Args:
-        encoder:           Encoder (frozen until fine_tune_encoder=True)
-        decoder:           Decoder (always trained)
-        dataloader:        training DataLoader
-        optimizer:         Adam covering decoder (and encoder when fine-tuning)
-        criterion:         CrossEntropyLoss(ignore_index=PAD_IDX)
-        device:            torch.device
-        epoch:             current epoch number (for logging)
-        fine_tune_encoder: when True, encoder runs in train mode and gradients
-                           are computed through it; param group must already be
-                           added to optimizer before calling this.
-
-    Returns:
-        avg_loss: float
+    When lambda_weight=0, the regularisation term is fully disabled.
     """
     if fine_tune_encoder:
         encoder.train()
@@ -124,41 +114,29 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
         captions = captions.to(device)
         lengths  = lengths.to(device)
 
-        # Encode: (batch, 196, 512).  Skip no_grad when fine-tuning so
-        # gradients flow through the unfrozen encoder layers.
         if fine_tune_encoder:
             encoder_out = encoder(images)
         else:
             with torch.no_grad():
                 encoder_out = encoder(images)
 
-        # Decode: predictions (batch, max_len-1, vocab_size)
-        #         alphas      (batch, max_len-1, 196)
         predictions, alphas = decoder(encoder_out, captions, lengths)
 
-        # Targets are captions shifted left by one (exclude <start>)
-        # Shape: (batch * (max_len-1),)
-        # Future work (Issue #7): Add a tiny regression test confirming that
-        # `captions[:, 1:]` is the correct next-token target for the decoder
-        # outputs produced from inputs that still include `<start>`.
         targets = captions[:, 1:]   # (batch, max_len-1)
 
-        # Flatten for cross-entropy
         vocab_size = predictions.size(-1)
         loss_ce = criterion(
             predictions.reshape(-1, vocab_size),
             targets.reshape(-1),
         )
 
-        # Doubly stochastic attention regularisation (Eq. 14).
-        loss_ds = doubly_stochastic_attention_loss(alphas, LAMBDA)
+        loss_ds = doubly_stochastic_attention_loss(alphas, lambda_weight)
 
         loss = loss_ce + loss_ds
 
         optimizer.zero_grad()
         loss.backward()
 
-        # Gradient clipping to prevent LSTM exploding gradients
         nn.utils.clip_grad_norm_(decoder.parameters(), GRAD_CLIP)
 
         optimizer.step()
@@ -176,11 +154,7 @@ def validate(encoder, decoder, dataloader, vocab, device):
     Greedy-decode the validation set and compute BLEU scores.
 
     Returns:
-        dict with keys `bleu1`/`bleu2`/`bleu3`/`bleu4`; `bleu4` remains the
-        checkpoint-selection metric.
-    Future work (Issue #10, deferred): If a beam-search comparison is needed for the
-    report, add it as an explicit alternate validation path; do not replace the
-    current greedy baseline silently.
+        dict with keys `bleu1`/`bleu2`/`bleu3`/`bleu4`.
     """
     encoder.eval()
     decoder.eval()
@@ -191,24 +165,17 @@ def validate(encoder, decoder, dataloader, vocab, device):
     for images, captions, lengths, all_caps in tqdm(dataloader, desc="[val]", leave=False):
         images = images.to(device)
 
-        encoder_out = encoder(images)   # (batch, 196, 512)
+        encoder_out = encoder(images)   # (batch, L, 512)
         batch_size = images.size(0)
 
-        # Greedy decode — one sample at a time for simplicity
-        # Future work (Issue #10, deferred): If validation throughput becomes a bottleneck,
-        # vectorize greedy decoding across the batch and verify hypotheses remain
-        # identical to the current per-image implementation.
         for i in range(batch_size):
-            ann = encoder_out[i].unsqueeze(0)  # (1, 196, 512)
+            ann = encoder_out[i].unsqueeze(0)  # (1, L, 512)
             caption, _, _ = greedy_decode_from_encoder_out(
                 decoder, ann, vocab, device, max_len=MAX_DECODE_LEN
             )
             hyp_tokens = caption.split()
             hypotheses.append(hyp_tokens)
 
-            # All 5 reference captions for this image — tokenise directly,
-            # never route through the vocabulary (that would corrupt any word
-            # outside the top-10k with <unk> and break BLEU scoring).
             refs_tokens = [tokenize_caption(cap) for cap in all_caps[i]]
             references.append(refs_tokens)
 
@@ -216,29 +183,105 @@ def validate(encoder, decoder, dataloader, vocab, device):
     return scores
 
 
-def main():
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Train Show, Attend and Tell (+ ablation variants)"
+    )
+    # --- Ablation flags ---
+    parser.add_argument(
+        "--attention_mode",
+        choices=["soft", "none"],
+        default=ATTENTION_MODE,
+        help="Attention variant: 'soft' (default, paper) or 'none' (static mean context).",
+    )
+    parser.add_argument(
+        "--no_beta_gate",
+        action="store_true",
+        default=False,
+        help="Disable the learned β scalar gate (force β=1 at every step).",
+    )
+    parser.add_argument(
+        "--lambda_weight",
+        type=float,
+        default=LAMBDA,
+        help=(
+            f"Doubly stochastic attention regularisation weight (default: {LAMBDA}). "
+            "Set to 0 to fully disable."
+        ),
+    )
+    parser.add_argument(
+        "--feature_grid_size",
+        type=int,
+        choices=[7, 14],
+        default=FEATURE_GRID_SIZE,
+        help=(
+            f"Spatial resolution of encoder annotations: 14 (default, L=196) "
+            "or 7 (ablation, L=49)."
+        ),
+    )
+    parser.add_argument(
+        "--finetune_epoch",
+        type=int,
+        default=ENCODER_FINETUNE_EPOCH,
+        help=f"Epoch to start encoder fine-tuning (default: {ENCODER_FINETUNE_EPOCH}).",
+    )
+    # --- Output dirs ---
+    parser.add_argument(
+        "--checkpoint_dir",
+        default=CHECKPOINT_DIR,
+        help=f"Directory for epoch and best checkpoints (default: {CHECKPOINT_DIR}).",
+    )
+    parser.add_argument(
+        "--results_dir",
+        default=RESULTS_DIR,
+        help=f"Directory for training_log.csv and config.json (default: {RESULTS_DIR}).",
+    )
+    return parser
+
+
+def main(args=None):
     """
     Full training loop with checkpointing and early stopping.
 
-    Future work (Issue #7, deferred): If CLI usage expands, expose `data_root`,
-    `checkpoint_dir`, and key hyperparameters via argparse while preserving the
-    current constant defaults.
-    Future work (Issue #8, deferred): If resume support is needed, load epoch/model/
-    optimizer state from a checkpoint and resume the early-stopping counters
-    without changing the non-resume path.
-    Future work (Issue #9, deferred): If report generation is scripted, print a final
-    BLEU summary table at the end of training using the last validation scores.
+    Pass a pre-built Namespace to call programmatically (e.g. from
+    scripts/run_ablations.py); omit it to parse sys.argv.
     """
+    if args is None:
+        args = _build_parser().parse_args()
+
+    use_beta_gate = not args.no_beta_gate
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(
+        f"Config: attention_mode={args.attention_mode}, "
+        f"use_beta_gate={use_beta_gate}, "
+        f"lambda={args.lambda_weight}, "
+        f"feature_grid_size={args.feature_grid_size}"
+    )
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs(args.results_dir, exist_ok=True)
+
+    # Save the full config so evaluate.py / visualize.py can recreate the model.
+    config_path = os.path.join(args.results_dir, "config.json")
+    with open(config_path, "w") as f:
+        json.dump(
+            {
+                "attention_mode": args.attention_mode,
+                "use_beta_gate": use_beta_gate,
+                "lambda_weight": args.lambda_weight,
+                "feature_grid_size": args.feature_grid_size,
+                "finetune_epoch": args.finetune_epoch,
+                "checkpoint_dir": args.checkpoint_dir,
+                "results_dir": args.results_dir,
+            },
+            f,
+            indent=2,
+        )
+    print(f"Config saved → {config_path}")
 
     # Build or load vocabulary
-    # Future work (Issue #2, deferred): If dataset setup is split into multiple scripts,
-    # move vocab construction into a dedicated command and keep this fallback
-    # path for small one-shot training runs.
     if os.path.exists(VOCAB_PATH):
         print("Loading vocabulary...")
         vocab = Vocabulary.load(VOCAB_PATH)
@@ -251,28 +294,29 @@ def main():
         vocab.save(VOCAB_PATH)
         print(f"Vocabulary size: {len(vocab)}")
 
-    # Dataloaders
     num_workers = min(4, os.cpu_count() or 1)
     train_loader = get_dataloader(DATA_ROOT, vocab, "train", BATCH_SIZE,
                                   num_workers=num_workers)
     val_loader   = get_dataloader(DATA_ROOT, vocab, "val",   BATCH_SIZE,
                                   num_workers=num_workers, use_bucket_sampler=False)
 
-    # Models
-    encoder = Encoder(fine_tune=False).to(device)
+    encoder = Encoder(
+        fine_tune=False,
+        feature_grid_size=args.feature_grid_size,
+    ).to(device)
+
     decoder = Decoder(
         attention_dim=ATTENTION_DIM,
         embed_dim=EMBED_DIM,
         decoder_dim=DECODER_DIM,
         vocab_size=len(vocab),
         dropout=DROPOUT,
+        attention_mode=args.attention_mode,
+        use_beta_gate=use_beta_gate,
     ).to(device)
 
-    # Decoder optimizer — encoder params are added as a second group when
-    # fine-tuning starts so each group keeps its own LR.
     optimizer = Adam(decoder.parameters(), lr=LEARNING_RATE)
 
-    # Reduce LR by half when BLEU-4 stops improving for 3 epochs.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=0.5, patience=3
     )
@@ -283,15 +327,19 @@ def main():
     best_scores = None
     epochs_no_improve = 0
     fine_tune_encoder = False
-    log_path = os.path.join(RESULTS_DIR, "training_log.csv")
+
+    log_path = os.path.join(args.results_dir, "training_log.csv")
     with open(log_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_bleu1", "val_bleu2", "val_bleu3", "val_bleu4", "seconds"])
+        writer.writerow([
+            "epoch", "train_loss",
+            "val_bleu1", "val_bleu2", "val_bleu3", "val_bleu4",
+            "seconds",
+        ])
 
     for epoch in range(1, NUM_EPOCHS + 1):
 
-        # Enable encoder fine-tuning after warmup and add its params to optimizer.
-        if epoch == ENCODER_FINETUNE_EPOCH + 1 and not fine_tune_encoder:
+        if epoch == args.finetune_epoch + 1 and not fine_tune_encoder:
             encoder._enable_fine_tune()
             optimizer.add_param_group({
                 "params": [p for p in encoder.parameters() if p.requires_grad],
@@ -304,6 +352,7 @@ def main():
         train_loss = train_epoch(
             encoder, decoder, train_loader, optimizer, criterion, device, epoch,
             fine_tune_encoder=fine_tune_encoder,
+            lambda_weight=args.lambda_weight,
         )
         val_scores = validate(encoder, decoder, val_loader, vocab, device)
         val_bleu4 = val_scores["bleu4"]
@@ -329,11 +378,7 @@ def main():
                 f"{elapsed:.2f}",
             ])
 
-        # Checkpoint every epoch
-        # Future work (Issue #9, deferred): If resume-from-best is required, keep saving
-        # optimizer state here and mirror it into `best.pt` as well so both
-        # checkpoint formats remain usable.
-        ckpt_path = os.path.join(CHECKPOINT_DIR, f"epoch_{epoch:03d}.pt")
+        ckpt_path = os.path.join(args.checkpoint_dir, f"epoch_{epoch:03d}.pt")
         torch.save({
             "epoch": epoch,
             "decoder": decoder.state_dict(),
@@ -342,9 +387,13 @@ def main():
             "val_scores": val_scores,
             "val_bleu4": val_bleu4,
             "vocab_size": len(vocab),
+            # Ablation config stored in the checkpoint so evaluate.py can
+            # warn if the user passes mismatched flags.
+            "attention_mode": args.attention_mode,
+            "use_beta_gate": use_beta_gate,
+            "feature_grid_size": args.feature_grid_size,
         }, ckpt_path)
 
-        # Track best model
         if val_bleu4 > best_bleu4:
             best_bleu4 = val_bleu4
             best_scores = val_scores
@@ -356,12 +405,15 @@ def main():
                 "val_scores": val_scores,
                 "val_bleu4": val_bleu4,
                 "vocab_size": len(vocab),
-            }, os.path.join(CHECKPOINT_DIR, "best.pt"))
+                "attention_mode": args.attention_mode,
+                "use_beta_gate": use_beta_gate,
+                "feature_grid_size": args.feature_grid_size,
+            }, os.path.join(args.checkpoint_dir, "best.pt"))
             print(f"  -> New best BLEU-4: {best_bleu4*100:.2f}")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= PATIENCE:
-                print(f"Early stopping after {epoch} epochs (no improvement for {PATIENCE}).")
+                print(f"Early stopping after {epoch} epochs.")
                 break
 
     print(f"Training complete. Best val BLEU-4: {best_bleu4*100:.2f}")
@@ -370,15 +422,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Train Show, Attend and Tell")
-    parser.add_argument("--lambda_weight", type=float, default=LAMBDA,
-                        help=f"Doubly stochastic attention regularisation weight (default: {LAMBDA})")
-    parser.add_argument("--finetune_epoch", type=int, default=ENCODER_FINETUNE_EPOCH,
-                        help=f"Epoch to start encoder fine-tuning (default: {ENCODER_FINETUNE_EPOCH})")
-    args = parser.parse_args()
-
-    LAMBDA = args.lambda_weight
-    ENCODER_FINETUNE_EPOCH = args.finetune_epoch
-
     main()

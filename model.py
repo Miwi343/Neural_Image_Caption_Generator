@@ -7,7 +7,7 @@ from models import Decoder, Encoder
 
 
 class ShowAttendTell(nn.Module):
-    """Ties the frozen VGG encoder and soft-attention decoder together."""
+    """Ties the VGG encoder and soft-attention decoder together."""
 
     def __init__(
         self,
@@ -18,9 +18,15 @@ class ShowAttendTell(nn.Module):
         encoder_dim: int = 512,
         dropout: float = 0.5,
         fine_tune_encoder: bool = False,
+        attention_mode: str = "soft",
+        use_beta_gate: bool = True,
+        feature_grid_size: int = 14,
     ):
         super().__init__()
-        self.encoder = Encoder(fine_tune=fine_tune_encoder)
+        self.encoder = Encoder(
+            fine_tune=fine_tune_encoder,
+            feature_grid_size=feature_grid_size,
+        )
         self.decoder = Decoder(
             attention_dim=attention_dim,
             embed_dim=embed_dim,
@@ -28,6 +34,8 @@ class ShowAttendTell(nn.Module):
             vocab_size=vocab_size,
             encoder_dim=encoder_dim,
             dropout=dropout,
+            attention_mode=attention_mode,
+            use_beta_gate=use_beta_gate,
         )
 
     def forward(

@@ -1,15 +1,23 @@
 """Attention visualisation for generated captions.
 
-For each generated word, the 196-dimensional attention weight vector α is:
-  1. Reshaped to (14, 14).
-  2. Upsampled by factor 16 to (224, 224) via bilinear interpolation.
+For each generated word, the L-dimensional attention weight vector α is:
+  1. Reshaped to (grid, grid) — where grid = sqrt(L), so 14 or 7.
+  2. Upsampled to (224, 224) via bilinear interpolation.
   3. Smoothed with a Gaussian filter (σ = 8px).
   4. Overlaid as a semi-transparent heatmap on the original image.
 
 Paper section 5.4:
   "We simply upsample the weights by a factor of 2^4 = 16 and apply a
-   Gaussian filter."
+   Gaussian filter."  (This refers to the 14×14 default; upsampling to 224
+   works identically for 7×7 via bilinear interpolation with a fixed target.)
 
+Ablation notes:
+  - none attention: the returned alpha is a 1/L placeholder.
+    Visualization shows a flat, featureless overlay — this is the expected and
+    correct behaviour (the model used no spatial attention during decoding).
+  - feature_grid_size=7: L=49, grid=7.  The upsample target stays 224×224.
+  - All other ablation modes (no_beta_gate, lambda=0) produce normal alpha
+    maps and work with this script without any special handling.
 """
 
 import glob
@@ -27,7 +35,15 @@ from PIL import Image
 from scipy.ndimage import gaussian_filter
 from torchvision import transforms
 
-from config import ATTENTION_DIM, DECODER_DIM, EMBED_DIM, MAX_DECODE_LEN
+from config import (
+    ATTENTION_DIM,
+    ATTENTION_MODE,
+    DECODER_DIM,
+    EMBED_DIM,
+    FEATURE_GRID_SIZE,
+    MAX_DECODE_LEN,
+    USE_BETA_GATE,
+)
 from models import Encoder, Decoder
 from utils import Vocabulary, greedy_decode, load_flickr8k_captions
 
@@ -60,36 +76,40 @@ def _unnormalize(tensor: torch.Tensor) -> np.ndarray:
 def visualize_attention(
     image_tensor: torch.Tensor,     # (3, 224, 224) normalised
     caption_words: List[str],
-    alphas: torch.Tensor,           # (num_steps, 196)
+    alphas: torch.Tensor,           # (num_steps, L) — L=196 or 49
     save_path: Optional[str] = None,
     show: bool = False,
     title: str = "",
     dpi: int = 200,
     sigma: float = 8.0,
     overlay_style: str = "paper",
+    attention_mode: str = "soft",
 ) -> None:
     """
     Plot the word-by-word attention overlay, matching paper Figures 2 & 3.
 
     Args:
-        image_tensor:  (3, 224, 224) — ImageNet-normalised input image
-        caption_words: list of generated words (excluding <start>/<end>)
-        alphas:        (num_steps, 196) — one row per generated word
-        save_path:     if provided, save figure to this path (PNG/PDF)
-        show:          if True, call plt.show() (requires a display)
-        title:         optional figure suptitle
-
-        dpi:           output DPI
-        sigma:         Gaussian blur strength after upsampling
-        overlay_style: "paper" for grayscale/white highlight or "heatmap"
+        image_tensor:   (3, 224, 224) — ImageNet-normalised input image
+        caption_words:  list of generated words (excluding <start>/<end>)
+        alphas:         (num_steps, L) — one row per generated word.
+                        L=196 for the 14×14 grid, L=49 for 7×7.
+        save_path:      if provided, save figure to this path (PNG/PDF)
+        show:           if True, call plt.show() (requires a display)
+        title:          optional figure suptitle
+        dpi:            output DPI
+        sigma:          Gaussian blur strength after upsampling
+        overlay_style:  "paper" for grayscale/white highlight or "heatmap"
+        attention_mode: passed through for the subtitle note on uniform/none maps
     """
     if overlay_style not in {"paper", "heatmap"}:
         raise ValueError("overlay_style must be 'paper' or 'heatmap'.")
 
     img_np = _unnormalize(image_tensor)   # (224, 224, 3)
 
+    L = alphas.shape[-1]
+    grid_size = int(round(L ** 0.5))     # 14 for L=196, 7 for L=49
+
     n_words = len(caption_words)
-    # Grid: original image + one cell per word, wrap at 4 columns
     n_cols = 4
     n_rows = max(1, math.ceil((n_words + 1) / n_cols))
 
@@ -101,11 +121,16 @@ def visualize_attention(
     axes[0].set_title("Input", fontsize=10)
     axes[0].axis("off")
 
+    # Uniform / none modes produce flat maps — annotate the figure.
+    if attention_mode == "none":
+        flat_note = f"[{attention_mode} — uniform α shown]"
+        fig.text(0.5, 0.01, flat_note, ha="center", fontsize=9, color="gray")
+
     for t, word in enumerate(caption_words):
         ax = axes[t + 1]
 
-        # Reshape α from (196,) to (14, 14), then upsample by 16 to (224, 224).
-        alpha_map = alphas[t].view(1, 1, 14, 14)
+        # Reshape α from (L,) to (grid, grid), then upsample to (224, 224).
+        alpha_map = alphas[t].view(1, 1, grid_size, grid_size)
         alpha_up = F.interpolate(
             alpha_map,
             size=(224, 224),
@@ -141,7 +166,6 @@ def visualize_attention(
         ax.set_title(word, fontsize=10)
         ax.axis("off")
 
-    # Hide unused axes
     for ax in axes[n_words + 1:]:
         ax.axis("off")
 
@@ -174,30 +198,36 @@ def run_visualization(
     dpi: int = 200,
     sigma: float = 8.0,
     overlay_style: str = "paper",
+    attention_mode: str = ATTENTION_MODE,
+    use_beta_gate: bool = USE_BETA_GATE,
+    feature_grid_size: int = FEATURE_GRID_SIZE,
 ):
     """
-    Load a checkpoint, generate captions, and save attention figures for each
-    image in `image_paths`.
+    Load a checkpoint, generate captions, and save attention figures.
 
-    Args:
-        checkpoint_path: path to .pt checkpoint from train.py
-        vocab_path:      path to vocab.json
-        image_paths:     list of image file paths to caption & visualise
-        output_dir:      directory to write PNG files
+    For attention_mode="none" the saved figures will show uniform/flat overlays
+    (the model did not use spatial attention during decoding).
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     vocab = Vocabulary.load(vocab_path)
     ckpt  = torch.load(checkpoint_path, map_location=device)
 
-    encoder = Encoder(fine_tune=False).to(device)
+    encoder = Encoder(
+        fine_tune=False,
+        feature_grid_size=feature_grid_size,
+    ).to(device)
+
     decoder = Decoder(
         attention_dim=ATTENTION_DIM,
         embed_dim=EMBED_DIM,
         decoder_dim=DECODER_DIM,
         vocab_size=len(vocab),
         dropout=0.0,
+        attention_mode=attention_mode,
+        use_beta_gate=use_beta_gate,
     ).to(device)
+
     encoder.load_state_dict(ckpt["encoder"])
     decoder.load_state_dict(ckpt["decoder"])
     encoder.eval()
@@ -209,8 +239,8 @@ def run_visualization(
         print(f"Processing: {img_path}")
 
         pil_img = Image.open(img_path).convert("RGB")
-        img_tensor = _EVAL_TRANSFORM(pil_img)           # (3, 224, 224) normalised
-        img_batch  = img_tensor.unsqueeze(0).to(device)  # (1, 3, 224, 224)
+        img_tensor = _EVAL_TRANSFORM(pil_img)
+        img_batch  = img_tensor.unsqueeze(0).to(device)
 
         caption, alphas, token_ids = greedy_decode(
             encoder,
@@ -235,6 +265,7 @@ def run_visualization(
             dpi=dpi,
             sigma=sigma,
             overlay_style=overlay_style,
+            attention_mode=attention_mode,
         )
 
 
@@ -263,17 +294,37 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Visualise attention maps")
-    parser.add_argument("--checkpoint",  default="checkpoints/best.pt")
-    parser.add_argument("--vocab",       default="data/flickr8k/vocab.json")
-    parser.add_argument("--images",      nargs="+",
+    parser.add_argument("--checkpoint",    default="checkpoints/best.pt")
+    parser.add_argument("--vocab",         default="data/flickr8k/vocab.json")
+    parser.add_argument("--images",        nargs="+",
                         help="Paths to one or more images")
-    parser.add_argument("--data_root",   default="data/flickr8k")
-    parser.add_argument("--split",       default="test", choices=["val", "test"])
-    parser.add_argument("--num_examples", type=int, default=6)
-    parser.add_argument("--output_dir",  default="results/attention_examples")
-    parser.add_argument("--dpi", type=int, default=200)
-    parser.add_argument("--sigma", type=float, default=8.0)
+    parser.add_argument("--data_root",     default="data/flickr8k")
+    parser.add_argument("--split",         default="test", choices=["val", "test"])
+    parser.add_argument("--num_examples",  type=int, default=6)
+    parser.add_argument("--output_dir",    default="results/attention_examples")
+    parser.add_argument("--dpi",           type=int, default=200)
+    parser.add_argument("--sigma",         type=float, default=8.0)
     parser.add_argument("--overlay_style", default="paper", choices=["paper", "heatmap"])
+    # --- Ablation flags (must match the flags used during training) ---
+    parser.add_argument(
+        "--attention_mode",
+        choices=["soft", "none"],
+        default=ATTENTION_MODE,
+        help="Must match the mode used when training the checkpoint.",
+    )
+    parser.add_argument(
+        "--no_beta_gate",
+        action="store_true",
+        default=False,
+        help="Disable beta gate (must match training setting).",
+    )
+    parser.add_argument(
+        "--feature_grid_size",
+        type=int,
+        choices=[7, 14],
+        default=FEATURE_GRID_SIZE,
+        help="Feature grid size (must match training setting).",
+    )
     args = parser.parse_args()
 
     image_paths = expand_image_inputs(args.images)
@@ -292,4 +343,7 @@ if __name__ == "__main__":
         dpi=args.dpi,
         sigma=args.sigma,
         overlay_style=args.overlay_style,
+        attention_mode=args.attention_mode,
+        use_beta_gate=not args.no_beta_gate,
+        feature_grid_size=args.feature_grid_size,
     )

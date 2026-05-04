@@ -12,6 +12,17 @@ Key design choices that match the paper exactly:
   - Deep output layer: p(y_t) ∝ exp(L_o(E*y_{t-1} + L_h*h_t + L_z*ẑ_t))
     (Eq. 7).
 
+Ablation extensions (all default to the paper's exact behaviour):
+  attention_mode : str
+    "soft" — learned additive attention (default, paper Sec. 4.2).
+    "none" — replace the dynamic context vector with the static mean-pooled
+             annotation (ẑ_t = mean_i a_i).  No attention MLP is called;
+             a uniform α is returned as a placeholder for visualization.
+  use_beta_gate : bool
+    True  — predict a scalar β from h_{t-1} and scale the context vector
+            (default, paper Sec. 4.2.1).
+    False — force β_t = 1 (identity gate) to test whether beta contributes.
+
 Future work (Issue #6, deferred): Add scheduled sampling by introducing a
 teacher-forcing ratio that decays from train.py; the default must remain full
 teacher forcing so proposal-faithful runs are unchanged.
@@ -25,17 +36,15 @@ import torch.nn as nn
 
 from models.attention import Attention
 
+VALID_ATTENTION_MODES = ("soft", "none")
+
 
 class Decoder(nn.Module):
     """
-    One-step-at-a-time LSTM decoder with soft attention.
+    One-step-at-a-time LSTM decoder with configurable attention.
 
     During training, the full sequence is unrolled with teacher forcing.
     During inference, use greedy or beam search in evaluate.py.
-
-    Future work (Issue #6, deferred): If scheduled sampling is implemented, expose the
-    teacher-forcing ratio and decay schedule in train.py while keeping the
-    default ratio at 1.0 for baseline proposal runs.
     """
 
     def __init__(
@@ -46,20 +55,26 @@ class Decoder(nn.Module):
         vocab_size: int,
         encoder_dim: int = 512,
         dropout: float = 0.5,
+        attention_mode: str = "soft",
+        use_beta_gate: bool = True,
     ):
         """
         Args:
-            attention_dim: hidden size of the attention MLP
-            embed_dim:     word embedding dimension  (m in the paper)
-            decoder_dim:   LSTM hidden size          (n in the paper)
-            vocab_size:    size of output vocabulary (K in the paper)
-            encoder_dim:   annotation vector dim     (D in the paper, =512)
-            dropout:       dropout probability applied before deep output
-
-        Future work (Issue #6, deferred): If constructor cleanup is assigned, replace
-        the long positional arg list with a decoder config object shared by
-        training, evaluation, and visualization scripts.
+            attention_dim:   hidden size of the attention MLP
+            embed_dim:       word embedding dimension  (m in the paper)
+            decoder_dim:     LSTM hidden size          (n in the paper)
+            vocab_size:      size of output vocabulary (K in the paper)
+            encoder_dim:     annotation vector dim     (D in the paper, =512)
+            dropout:         dropout probability applied before deep output
+            attention_mode:  "soft" | "none"  (default: "soft")
+            use_beta_gate:   whether to apply the learned β scalar gate
+                             (default: True, matches paper Sec. 4.2.1)
         """
+        if attention_mode not in VALID_ATTENTION_MODES:
+            raise ValueError(
+                f"attention_mode must be one of {VALID_ATTENTION_MODES}, "
+                f"got '{attention_mode}'."
+            )
         super().__init__()
 
         self.encoder_dim = encoder_dim
@@ -67,6 +82,8 @@ class Decoder(nn.Module):
         self.embed_dim = embed_dim
         self.decoder_dim = decoder_dim
         self.vocab_size = vocab_size
+        self.attention_mode = attention_mode
+        self.use_beta_gate = use_beta_gate
 
         self.attention = Attention(encoder_dim, decoder_dim, attention_dim)
 
@@ -74,24 +91,18 @@ class Decoder(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
 
         # LSTMCell input: [embedding || context_vector] = embed_dim + encoder_dim.
-        # The previous hidden state is supplied through the recurrent state tuple,
-        # which is algebraically equivalent to the paper's gate equations using
-        # E*y_{t-1}, h_{t-1}, and z_t.
         self.lstm_cell = nn.LSTMCell(embed_dim + encoder_dim, decoder_dim)
 
         # Init MLPs: mean annotation → h0 / c0  (paper "init,c" and "init,h")
         self.init_h = nn.Linear(encoder_dim, decoder_dim)
         self.init_c = nn.Linear(encoder_dim, decoder_dim)
 
-        # Beta gate: scalar in (0, 1) to weight the context vector
-        # (section 4.2.1).
+        # Beta gate: scalar in (0, 1) to weight the context vector (Sec. 4.2.1).
+        # Always constructed so checkpoints are compatible regardless of
+        # use_beta_gate; the gate is simply bypassed (β forced to 1) when disabled.
         self.f_beta = nn.Linear(decoder_dim, 1)
 
-        # Deep output layer projections (Eq. 7):
-        #   L_o  : vocab projection       K×m
-        #   L_h  : hidden → embed space   m×n
-        #   L_z  : context → embed space  m×D
-        # E * y_{t-1} is already embed_dim so we reuse the embedding matrix
+        # Deep output layer projections (Eq. 7)
         self.L_h = nn.Linear(decoder_dim, embed_dim)
         self.L_z = nn.Linear(encoder_dim, embed_dim)
         self.L_o = nn.Linear(embed_dim, vocab_size)
@@ -99,10 +110,6 @@ class Decoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Uniform initialisation for embedding and output layers."""
-        # Future work (Issue #6, deferred): Compare the current uniform init to Xavier
-        # on a short Flickr8k training run and keep the simpler scheme unless
-        # the alternate init improves convergence or BLEU consistently.
         nn.init.uniform_(self.embedding.weight, -0.1, 0.1)
         nn.init.uniform_(self.L_o.weight, -0.1, 0.1)
         nn.init.constant_(self.L_o.bias, 0)
@@ -117,14 +124,48 @@ class Decoder(nn.Module):
         Returns:
             h: (batch, decoder_dim)
             c: (batch, decoder_dim)
-
-        Future work (Issue #6): Add a unit test asserting both `h0` and `c0` pass
-        through `tanh`, which keeps their values bounded in `[-1, 1]`.
         """
         mean_ann = encoder_out.mean(dim=1)   # (batch, D)
         h = torch.tanh(self.init_h(mean_ann))
         c = torch.tanh(self.init_c(mean_ann))
         return h, c
+
+    def _compute_context(
+        self,
+        encoder_out: torch.Tensor,
+        h: torch.Tensor,
+    ):
+        """
+        Return (z_hat, alpha) according to the current attention_mode.
+
+        attention_mode="soft":
+            Learned additive attention (paper Eq. 4-6, 13).
+        attention_mode="none":
+            Static mean-pooled context ẑ = mean_i a_i; no attention MLP used.
+            A uniform α is returned as a placeholder for visualization.
+
+        Args:
+            encoder_out: (batch, L, D)
+            h:           (batch, decoder_dim)
+
+        Returns:
+            z_hat: (batch, D)  context vector
+            alpha: (batch, L)  attention weights (may be uniform placeholder)
+        """
+        batch_size = encoder_out.size(0)
+        L = encoder_out.size(1)
+
+        if self.attention_mode == "soft":
+            z_hat, alpha = self.attention(encoder_out, h)
+
+        else:  # "none"
+            z_hat = encoder_out.mean(dim=1)
+            # Return uniform alpha as a blank placeholder for visualization.
+            alpha = torch.full(
+                (batch_size, L), 1.0 / L, device=encoder_out.device
+            )
+
+        return z_hat, alpha
 
     def decode_step(
         self,
@@ -134,7 +175,7 @@ class Decoder(nn.Module):
         c: torch.Tensor,
     ):
         """
-        Run one soft-attention decoder step.
+        Run one decoder step.
 
         Args:
             encoder_out: (batch, L, D) annotation vectors
@@ -146,35 +187,34 @@ class Decoder(nn.Module):
             logits: (batch, vocab_size)
             h:      (batch, decoder_dim) updated hidden state
             c:      (batch, decoder_dim) updated cell state
-            alpha:  (batch, L) attention weights
-            beta:   (batch, 1) scalar context gate
+            alpha:  (batch, L) attention weights (or uniform placeholder)
+            beta:   (batch, 1) scalar context gate (or ones if disabled)
         """
         if prev_words.dim() == 2 and prev_words.size(1) == 1:
             prev_words = prev_words.squeeze(1)
 
-        embed = self.embedding(prev_words)  # (batch, embed_dim)
-        z_hat, alpha = self.attention(encoder_out, h)
+        embed = self.embedding(prev_words)          # (batch, embed_dim)
+        z_hat, alpha = self._compute_context(encoder_out, h)
 
-        beta = torch.sigmoid(self.f_beta(h))  # (batch, 1)
-        z_hat = beta * z_hat
+        if self.use_beta_gate:
+            beta = torch.sigmoid(self.f_beta(h))   # (batch, 1)
+            z_hat = beta * z_hat
+        else:
+            beta = torch.ones(h.size(0), 1, device=h.device)
 
         lstm_input = torch.cat([embed, z_hat], dim=1)
         h, c = self.lstm_cell(lstm_input, (h, c))
 
         logits = self.L_o(
-            self.dropout(
-                embed
-                + self.L_h(h)
-                + self.L_z(z_hat)
-            )
+            self.dropout(embed + self.L_h(h) + self.L_z(z_hat))
         )
         return logits, h, c, alpha, beta
 
     def forward(
         self,
-        encoder_out: torch.Tensor,   # (batch, L, D)
-        captions: torch.Tensor,      # (batch, max_len)  token ids incl. <start>
-        caption_lengths: torch.Tensor,  # (batch,)  actual lengths (incl. <start>)
+        encoder_out: torch.Tensor,
+        captions: torch.Tensor,
+        caption_lengths: torch.Tensor,
     ):
         """
         Teacher-forced forward pass over the full caption sequence.
@@ -188,23 +228,22 @@ class Decoder(nn.Module):
             predictions:  (batch, max_len-1, vocab_size)  logits
             alphas:       (batch, max_len-1, L)           attention weights
                           Used for doubly-stochastic regularisation (Eq. 14).
-
-        Future work (Issue #6, deferred): If qualitative analysis expands beyond alpha
-        maps, return the per-step beta gates as an optional third output without
-        breaking current callers that unpack `(predictions, alphas)`.
-        Future work (Issue #6, deferred): If scheduled sampling is added, make it opt-in
-        and preserve the current always-teacher-forced path as the baseline.
+                          For attention_mode "none", contains the
+                          1/L uniform placeholder values.
         """
         batch_size = encoder_out.size(0)
         L = encoder_out.size(1)
-        # Decode length = caption length minus the final <end> token
         decode_lengths = (caption_lengths - 1).clamp(min=1)
         max_decode_len = int(decode_lengths.max().item())
 
         h, c = self._init_hidden(encoder_out)
 
-        predictions = torch.zeros(batch_size, max_decode_len, self.vocab_size, device=encoder_out.device)
-        alphas = torch.zeros(batch_size, max_decode_len, L, device=encoder_out.device)
+        predictions = torch.zeros(
+            batch_size, max_decode_len, self.vocab_size, device=encoder_out.device
+        )
+        alphas = torch.zeros(
+            batch_size, max_decode_len, L, device=encoder_out.device
+        )
 
         for t in range(max_decode_len):
             logits, h, c, alpha, _ = self.decode_step(
@@ -216,6 +255,8 @@ class Decoder(nn.Module):
             predictions[:, t, :] = logits
             alphas[:, t, :] = alpha
 
+        # Zero out attention for inactive timesteps so the doubly-stochastic
+        # loss only accumulates over steps that actually ran.
         active = (
             torch.arange(max_decode_len, device=encoder_out.device).unsqueeze(0)
             < decode_lengths.unsqueeze(1)

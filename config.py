@@ -21,3 +21,17 @@ DATA_ROOT = "data/flickr8k"
 VOCAB_PATH = "data/flickr8k/vocab.json"
 CHECKPOINT_DIR = "checkpoints"
 RESULTS_DIR = "results"
+
+# ---------------------------------------------------------------------------
+# Ablation defaults — these reproduce the paper's exact behaviour unchanged.
+# Pass different values via CLI args in train.py / evaluate.py to run ablations.
+# ---------------------------------------------------------------------------
+
+# Attention mode: "soft" (paper default) | "none"
+ATTENTION_MODE = "soft"
+
+# Beta gate: True = learned scalar gate (paper default); False = force β=1
+USE_BETA_GATE = True
+
+# Feature grid spatial size: 14 (paper default, L=196) or 7 (ablation, L=49)
+FEATURE_GRID_SIZE = 14

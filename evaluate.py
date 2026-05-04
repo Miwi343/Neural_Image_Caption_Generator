@@ -9,7 +9,15 @@ import torch
 from nltk.translate.meteor_score import meteor_score as nltk_meteor
 from tqdm import tqdm
 
-from config import ATTENTION_DIM, DECODER_DIM, EMBED_DIM, MAX_DECODE_LEN
+from config import (
+    ATTENTION_DIM,
+    ATTENTION_MODE,
+    DECODER_DIM,
+    EMBED_DIM,
+    FEATURE_GRID_SIZE,
+    MAX_DECODE_LEN,
+    USE_BETA_GATE,
+)
 from models import Decoder, Encoder
 from utils import (
     Vocabulary,
@@ -22,6 +30,24 @@ from utils import (
 )
 
 
+def _warn_config_mismatch(ckpt: dict, args: argparse.Namespace) -> None:
+    """Print a warning if checkpoint ablation flags differ from CLI args."""
+    mismatches = []
+    for key, cli_val in [
+        ("attention_mode", args.attention_mode),
+        ("use_beta_gate", not args.no_beta_gate),
+        ("feature_grid_size", args.feature_grid_size),
+    ]:
+        ckpt_val = ckpt.get(key)
+        if ckpt_val is not None and ckpt_val != cli_val:
+            mismatches.append(f"  {key}: checkpoint={ckpt_val!r}, cli={cli_val!r}")
+    if mismatches:
+        print("WARNING: checkpoint ablation flags differ from CLI arguments:")
+        for m in mismatches:
+            print(m)
+        print("Using CLI values. Pass matching flags to avoid silent mismatch.")
+
+
 @torch.no_grad()
 def evaluate_test_set(
     checkpoint_path: str,
@@ -32,8 +58,11 @@ def evaluate_test_set(
     length_normalize: bool = False,
     batch_size: int = 1,
     results_out: str = "results/test_bleu.json",
+    attention_mode: str = ATTENTION_MODE,
+    use_beta_gate: bool = USE_BETA_GATE,
+    feature_grid_size: int = FEATURE_GRID_SIZE,
 ):
-    """Load a checkpoint, generate captions, print BLEU-1..4 + METEOR, and save JSON."""
+    """Load a checkpoint, generate captions, print BLEU-1..4 + METEOR, save JSON."""
     nltk.download("wordnet", quiet=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -43,13 +72,19 @@ def evaluate_test_set(
     print(f"Loading checkpoint from {checkpoint_path}...")
     ckpt = torch.load(checkpoint_path, map_location=device)
 
-    encoder = Encoder(fine_tune=False).to(device)
+    encoder = Encoder(
+        fine_tune=False,
+        feature_grid_size=feature_grid_size,
+    ).to(device)
+
     decoder = Decoder(
         attention_dim=ATTENTION_DIM,
         embed_dim=EMBED_DIM,
         decoder_dim=DECODER_DIM,
         vocab_size=len(vocab),
         dropout=0.0,
+        attention_mode=attention_mode,
+        use_beta_gate=use_beta_gate,
     ).to(device)
 
     encoder.load_state_dict(ckpt["encoder"])
@@ -97,9 +132,12 @@ def evaluate_test_set(
     ) / max(len(hypotheses), 1)
     scores["meteor"] = meteor
 
-    model_label = f"Our Soft-Attention (beam={beam_width}, len_norm={length_normalize})"
+    model_label = (
+        f"attention={attention_mode}, beta={use_beta_gate}, "
+        f"grid={feature_grid_size}, beam={beam_width}"
+    )
     print_bleu_table(model_label, scores, dataset=split.capitalize())
-    print(f"  METEOR: {meteor * 100:.2f}")
+    print(f"  METEOR (sentence-level avg): {meteor * 100:.2f}")
 
     if results_out:
         os.makedirs(os.path.dirname(results_out) or ".", exist_ok=True)
@@ -110,18 +148,23 @@ def evaluate_test_set(
                     "split": split,
                     "beam_width": beam_width,
                     "length_normalize": length_normalize,
+                    "attention_mode": attention_mode,
+                    "use_beta_gate": use_beta_gate,
+                    "feature_grid_size": feature_grid_size,
                     "scores": scores,
                 },
                 f,
                 indent=2,
             )
-        print(f"Saved BLEU results to {results_out}")
+        print(f"Saved results to {results_out}")
 
     return scores
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate Show, Attend and Tell")
+    parser = argparse.ArgumentParser(
+        description="Evaluate Show, Attend and Tell (+ ablation variants)"
+    )
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--data_root", default="data/flickr8k")
     parser.add_argument("--vocab", default="data/flickr8k/vocab.json")
@@ -130,7 +173,31 @@ if __name__ == "__main__":
     parser.add_argument("--length_normalize", action="store_true", default=False)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--results_out", default="results/test_bleu.json")
+    # --- Ablation flags (must match the flags used during training) ---
+    parser.add_argument(
+        "--attention_mode",
+        choices=["soft", "none"],
+        default=ATTENTION_MODE,
+        help="Must match the mode used when training the checkpoint.",
+    )
+    parser.add_argument(
+        "--no_beta_gate",
+        action="store_true",
+        default=False,
+        help="Disable beta gate (must match training setting).",
+    )
+    parser.add_argument(
+        "--feature_grid_size",
+        type=int,
+        choices=[7, 14],
+        default=FEATURE_GRID_SIZE,
+        help="Feature grid size (must match training setting).",
+    )
     args = parser.parse_args()
+
+    # Warn if checkpoint flags don't match
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    _warn_config_mismatch(ckpt, args)
 
     evaluate_test_set(
         checkpoint_path=args.checkpoint,
@@ -141,4 +208,7 @@ if __name__ == "__main__":
         length_normalize=args.length_normalize,
         batch_size=args.batch_size,
         results_out=args.results_out,
+        attention_mode=args.attention_mode,
+        use_beta_gate=not args.no_beta_gate,
+        feature_grid_size=args.feature_grid_size,
     )

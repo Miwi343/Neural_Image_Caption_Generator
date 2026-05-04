@@ -4,6 +4,11 @@ Encoder: CNN feature extractor.
 Paper section 3.1.1 — extract annotation vectors a_i ∈ R^D from a lower
 convolutional layer so the decoder can selectively attend to spatial locations.
 
+Ablation extension: the `feature_grid_size` argument (14 or 7) controls the
+spatial resolution of the annotation vectors fed to the decoder.  The default
+of 14 matches the paper exactly.  Setting it to 7 applies an adaptive average
+pool after the conv features, halving the grid and reducing L from 196 to 49.
+
 Future work (Issue #4): Add a shape regression test using a `224x224` input tensor
 that asserts `self.cnn(images)` is `(B, 512, 14, 14)` and `forward(images)` is
 `(B, 196, 512)`.
@@ -19,35 +24,24 @@ import torchvision.models as models
 
 class Encoder(nn.Module):
     """
-    Wraps a pretrained VGG-16 and exposes a 14x14x512 convolutional feature
-    map.
+    Wraps a pretrained VGG-16 and exposes a (grid×grid)×512 convolutional
+    feature map.
 
-    VGG-16 features layer indices (31 layers total, 0-30):
-      0-3:   conv1_1, relu, conv1_2, relu
-      4:     MaxPool → 112x112
-      5-8:   conv2_1, relu, conv2_2, relu
-      9:     MaxPool → 56x56
-      10-15: conv3_1, relu, conv3_2, relu, conv3_3, relu
-      16:    MaxPool → 28x28
-      17-22: conv4_1, relu, conv4_2, relu, conv4_3, relu
-      23:    MaxPool → 14x14   ← 4th max-pool; spatial size becomes 14x14
-      24-29: conv5_1, relu, conv5_2, relu, conv5_3, relu
-      30:    MaxPool → 7x7    ← 5th max-pool (NOT included)
+    Default (feature_grid_size=14): matches paper section 4.3 exactly.
+    Ablation (feature_grid_size=7): halves spatial resolution via adaptive
+    average pooling, giving L=49 annotation vectors instead of 196.
 
-    features[:30] keeps layers 0-29: through conv5_3+relu, before the 5th
-    max-pool.  Output is (batch, 512, 14, 14) for a 224x224 input, matching
-    the paper's "14×14×512 feature map … before max pooling" (section 4.3).
-
-    Output shape: (batch_size, L, D) = (batch_size, 196, 512)
-    where L = 14*14 = 196 annotation locations and D = 512 channels.
-
-    Future work (Issue #4, deferred): If fine-tuning is assigned, expose exactly which
-    VGG layers are unfrozen and preserve the current frozen-by-default behavior
-    for the proposal reproduction.
+    Output shape: (batch_size, L, D) = (batch_size, grid*grid, 512)
     """
 
-    def __init__(self, fine_tune: bool = False):
+    def __init__(self, fine_tune: bool = False, feature_grid_size: int = 14):
         super().__init__()
+
+        if feature_grid_size not in (7, 14):
+            raise ValueError(
+                f"feature_grid_size must be 7 or 14, got {feature_grid_size}."
+            )
+        self.feature_grid_size = feature_grid_size
 
         vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
 
@@ -59,17 +53,19 @@ class Encoder(nn.Module):
         for param in self.cnn.parameters():
             param.requires_grad = False
 
-        # Future work (Issue #4, deferred): Keep `fine_tune=False` as the default; if
-        # `True`, prove via a parameter-count or requires_grad check that only
-        # the intended top layers become trainable.
+        # For 7x7 ablation: adaptive average pool from 14x14 → 7x7.
+        # nn.Identity keeps the 14x14 map for the default setting.
+        self.downsample: nn.Module = (
+            nn.AdaptiveAvgPool2d((7, 7))
+            if feature_grid_size == 7
+            else nn.Identity()
+        )
+
         if fine_tune:
             self._enable_fine_tune()
 
     def _enable_fine_tune(self):
         """Unfreeze the last two conv blocks for fine-tuning."""
-        # Future work (Issue #4, deferred): Restrict unfreezing to `self.cnn[20:]` or a
-        # narrower top-block slice, then document the exact layer indices and
-        # optimizer LR used for those params.
         for param in self.cnn[20:].parameters():
             param.requires_grad = True
 
@@ -79,28 +75,21 @@ class Encoder(nn.Module):
             images: (batch_size, 3, 224, 224) — ImageNet-normalized
 
         Returns:
-            features: (batch_size, L, D) = (batch_size, 196, 512)
-
-        Future work (Issue #4): Raise a clear assertion or ValueError if the CNN output
-        is not `(batch, 512, 14, 14)` so preprocessing/model-slice mistakes fail
-        fast instead of silently corrupting attention geometry.
+            features: (batch_size, L, D) where L = grid*grid, D = 512
         """
-        # (batch, 512, 14, 14)
-        out = self.cnn(images)
+        out = self.cnn(images)          # (batch, 512, 14, 14)
+        out = self.downsample(out)      # (batch, 512, 14, 14) or (batch, 512, 7, 7)
 
-        batch_size, D, H, W = out.shape  # D=512, H=W=14
-        if (D, H, W) != (512, 14, 14):
+        batch_size, D, H, W = out.shape
+        expected = self.feature_grid_size
+        if D != 512 or H != expected or W != expected:
             raise ValueError(
-                "VGG encoder expected a (batch, 512, 14, 14) feature map from "
-                f"224x224 ImageNet-normalized images, got {tuple(out.shape)}."
+                f"Encoder expected (batch, 512, {expected}, {expected}), "
+                f"got {tuple(out.shape)}."
             )
-        L = H * W  # 196
+        L = H * W  # 196 or 49
 
-        # Reshape to (batch, L, D) so each of the 196 locations is a vector
-        # Future work (Issue #4): Add a tensor-ordering test confirming this permute +
-        # flatten keeps each annotation vector length `D=512` and maps the
-        # 14x14 spatial grid to `L=196` locations in a deterministic order.
-        out = out.permute(0, 2, 3, 1)   # (batch, 14, 14, 512)
-        out = out.view(batch_size, L, D) # (batch, 196, 512)
+        out = out.permute(0, 2, 3, 1)    # (batch, H, W, 512)
+        out = out.view(batch_size, L, D) # (batch, L, 512)
 
         return out
