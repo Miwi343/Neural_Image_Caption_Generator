@@ -1,4 +1,3 @@
-data/flickr8k/vocab.json
 checkpoints/
 results/
 __pycache__/
