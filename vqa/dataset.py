@@ -26,8 +26,10 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 from torch.utils.data import DataLoader, Dataset
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 from torchvision import transforms
 
 
@@ -247,7 +249,9 @@ class VQAYesNoDataset(Dataset):
         try:
             image = Image.open(img_path).convert("RGB")
         except Exception as e:
-            raise RuntimeError(f"Corrupt image at {img_path}: {e}") from e
+            import warnings
+            warnings.warn(f"Unreadable image {img_path}: {e} — substituting black frame")
+            image = Image.new("RGB", (224, 224))
         image = self.transform(image)
 
         ids = self.vocab.encode(question_str, max_len=self.max_q)

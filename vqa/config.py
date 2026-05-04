@@ -12,8 +12,8 @@ LEARNING_RATE = 3e-4
 ENCODER_LR = 1e-4
 ENCODER_FINETUNE_EPOCH = 5
 BATCH_SIZE = 128
-NUM_EPOCHS = 20
-PATIENCE = 7
+NUM_EPOCHS = 15
+PATIENCE = 5
 GRAD_CLIP = 5.0
 LAMBDA = 1.0            # doubly-stochastic attention regularisation weight
 
