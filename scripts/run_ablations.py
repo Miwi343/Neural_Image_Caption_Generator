@@ -376,10 +376,10 @@ if __name__ == "__main__":
                         help=f"Path to vocab.json (default: {VOCAB_PATH}).")
     args = parser.parse_args()
 
-    # Push data paths into module-level globals so all cmd builders pick them up
-    global DATA_ROOT, VOCAB_PATH
-    DATA_ROOT  = args.data_root
-    VOCAB_PATH = args.vocab
+    # Rebind module-level names so all cmd builders pick up the CLI values.
+    # No `global` needed — this block is already at module scope.
+    DATA_ROOT  = args.data_root  # noqa: F811
+    VOCAB_PATH = args.vocab      # noqa: F811
 
     if args.smoke:
         run_smoke()
