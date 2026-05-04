@@ -103,6 +103,10 @@ def evaluate_val(
         no_correct  += (preds[no_mask] == labels[no_mask]).sum().item()
         no_total    += no_mask.sum().item()
 
+    if total == 0:
+        print("Warning: no samples evaluated — val images missing?")
+        return {"overall_acc": 0.0, "yes_acc": 0.0, "no_acc": 0.0, "total": 0}
+
     results = {
         "overall_acc": correct / total,
         "yes_acc":     yes_correct / yes_total if yes_total else 0.0,

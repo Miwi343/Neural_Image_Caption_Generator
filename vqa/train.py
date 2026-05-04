@@ -123,6 +123,8 @@ def validate(model, loader, criterion, device):
         correct += (preds == labels).sum().item()
         total   += images.size(0)
 
+    if total == 0:
+        return float("nan"), float("nan")
     return total_loss / total, correct / total
 
 
@@ -229,43 +231,52 @@ def main(cfg: dict | None = None):
         )
         val_loss, val_acc = validate(model, val_loader, criterion, device)
         elapsed = time.time() - t0
+        has_val = not (val_acc != val_acc)  # nan check
 
         current_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(val_acc)
+        if has_val:
+            scheduler.step(val_acc)
 
+        val_loss_str = f"{val_loss:.4f}" if has_val else "n/a"
+        val_acc_str  = f"{val_acc:.4f}"  if has_val else "n/a"
         print(
             f"Epoch {epoch:3d}/{num_epochs} | "
             f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
-            f"val loss {val_loss:.4f} acc {val_acc:.4f} | "
+            f"val loss {val_loss_str} acc {val_acc_str} | "
             f"lr {current_lr:.2e} | {elapsed:.0f}s"
         )
 
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow(
                 [epoch, f"{train_loss:.6f}", f"{train_acc:.6f}",
-                 f"{val_loss:.6f}", f"{val_acc:.6f}", f"{current_lr:.2e}"]
+                 f"{val_loss:.6f}" if has_val else "nan",
+                 f"{val_acc:.6f}"  if has_val else "nan",
+                 f"{current_lr:.2e}"]
             )
 
         ckpt = {
             "epoch":          epoch,
             "model_state":    model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
-            "val_acc":        val_acc,
+            "val_acc":        val_acc if has_val else 0.0,
             "vocab_size":     len(vocab),
             "cfg":            c,
         }
         torch.save(ckpt, os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt"))
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            epochs_no_improve = 0
-            torch.save(ckpt, os.path.join(checkpoint_dir, "best.pt"))
-            print(f"  → New best val acc: {best_val_acc:.4f}")
+        if has_val:
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                epochs_no_improve = 0
+                torch.save(ckpt, os.path.join(checkpoint_dir, "best.pt"))
+                print(f"  → New best val acc: {best_val_acc:.4f}")
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f"Early stopping after {patience} epochs with no improvement.")
+                    break
         else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                print(f"Early stopping after {patience} epochs with no improvement.")
-                break
+            torch.save(ckpt, os.path.join(checkpoint_dir, "best.pt"))
 
     print(f"\nTraining complete. Best val acc: {best_val_acc:.4f}")
     print(f"Best checkpoint: {os.path.join(checkpoint_dir, 'best.pt')}")
