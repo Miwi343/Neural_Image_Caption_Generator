@@ -5,8 +5,8 @@ This script is intentionally Colab-friendly:
   - can normalize common Flickr8k/Kaggle folder layouts
   - downloads official train/val/test split files when only images/ and
     captions.txt are present (the typical Kaggle download layout)
+  - can download the public Flickr8k image/text release into data/flickr8k
   - can download/unzip a Kaggle dataset when kaggle.json is available
-  - keeps checkpoints/results inside the repo folder in Drive
 """
 
 import argparse
@@ -35,6 +35,10 @@ SPLIT_FILES = [
 OFFICIAL_TEXT_ZIP_URL = (
     "https://github.com/jbrownlee/Datasets/releases/download/"
     "Flickr8k/Flickr8k_text.zip"
+)
+OFFICIAL_IMAGE_ZIP_URL = (
+    "https://github.com/jbrownlee/Datasets/releases/download/"
+    "Flickr8k/Flickr8k_Dataset.zip"
 )
 
 # Paper/Flickr8k split sizes.
@@ -156,14 +160,45 @@ def generate_split_files(data_root: Path) -> bool:
     return strict_count_compatible
 
 
+def download_if_missing(url: str, zip_path: Path) -> None:
+    """Download a release asset once, leaving existing archives in place."""
+    ensure_dir(zip_path.parent)
+    if not zip_path.exists():
+        print(f"Downloading {url}")
+        urllib.request.urlretrieve(url, zip_path)
+
+
+def convert_token_file_to_captions(token_file: Path, captions_path: Path) -> None:
+    """Convert official Flickr8k.token.txt rows into this repo's captions.txt."""
+    if captions_path.exists():
+        return
+
+    rows = []
+    with open(token_file, encoding="utf-8", errors="replace") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or "\t" not in line:
+                continue
+            image_id, caption = line.split("\t", 1)
+            image_name = os.path.basename(image_id.strip().split("#")[0])
+            caption = caption.strip()
+            if image_name and caption:
+                rows.append(f"{image_name}\t{caption}")
+
+    if not rows:
+        raise ValueError(f"No caption rows could be read from {token_file}.")
+
+    ensure_dir(captions_path.parent)
+    captions_path.write_text("\n".join(rows) + "\n")
+    print(f"  Converted {token_file.name} -> {captions_path}")
+
+
 def download_official_split_files(data_root: Path, download_dir: Path | None = None) -> bool:
     """Download the official Flickr8k text archive and copy split files."""
     download_dir = download_dir or (data_root / "_official_text")
     ensure_dir(download_dir)
     zip_path = download_dir / "Flickr8k_text.zip"
-    if not zip_path.exists():
-        print(f"Downloading official Flickr8k split files from {OFFICIAL_TEXT_ZIP_URL}")
-        urllib.request.urlretrieve(OFFICIAL_TEXT_ZIP_URL, zip_path)
+    download_if_missing(OFFICIAL_TEXT_ZIP_URL, zip_path)
 
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(download_dir)
@@ -176,6 +211,32 @@ def download_official_split_files(data_root: Path, download_dir: Path | None = N
             print(f"  Copied official {filename}")
             copied = True
     return copied
+
+
+def download_public_flickr8k_release(
+    data_root: Path,
+    download_dir: Path | None = None,
+) -> bool:
+    """Download the public Flickr8k image/text release and normalize it."""
+    download_dir = download_dir or (data_root / "_public_download")
+    ensure_dir(download_dir)
+
+    image_zip = download_dir / "Flickr8k_Dataset.zip"
+    text_zip = download_dir / "Flickr8k_text.zip"
+    download_if_missing(OFFICIAL_IMAGE_ZIP_URL, image_zip)
+    download_if_missing(OFFICIAL_TEXT_ZIP_URL, text_zip)
+
+    for zip_path in (image_zip, text_zip):
+        print(f"Extracting {zip_path}")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(download_dir)
+
+    return normalize_flickr8k(
+        download_dir,
+        data_root,
+        use_symlink=True,
+        require_official_splits=True,
+    )
 
 
 def normalize_flickr8k(
@@ -232,8 +293,14 @@ def normalize_flickr8k(
     # ------------------------------------------------------------------
     captions_src = find_first(source_dir, ["captions.txt"])
     if captions_src is None:
-        raise FileNotFoundError(f"Could not find captions.txt under {source_dir}.")
-    copy_or_link(captions_src, data_root / "captions.txt", use_symlink=use_symlink)
+        token_src = find_first(source_dir, ["Flickr8k.token.txt"])
+        if token_src is None:
+            raise FileNotFoundError(
+                f"Could not find captions.txt or Flickr8k.token.txt under {source_dir}."
+            )
+        convert_token_file_to_captions(token_src, data_root / "captions.txt")
+    else:
+        copy_or_link(captions_src, data_root / "captions.txt", use_symlink=use_symlink)
 
     # ------------------------------------------------------------------
     # 3. Split files — link if present, otherwise fetch official files
@@ -299,6 +366,16 @@ def main():
     parser.add_argument("--repo_dir", default=".")
     parser.add_argument("--data_root", default="data/flickr8k")
     parser.add_argument("--source_dir", default="")
+    parser.add_argument(
+        "--download_public_flickr8k",
+        action="store_true",
+        help="Download the public Flickr8k release assets into data_root.",
+    )
+    parser.add_argument(
+        "--public_download_dir",
+        default="",
+        help="Optional cache directory for --download_public_flickr8k.",
+    )
     parser.add_argument("--download_kaggle", action="store_true")
     parser.add_argument(
         "--kaggle_dataset",
@@ -321,6 +398,15 @@ def main():
 
     repo_dir = Path(args.repo_dir).expanduser().resolve()
     data_root = (repo_dir / args.data_root).resolve()
+
+    if args.download_public_flickr8k:
+        public_download_dir = Path(args.public_download_dir) if args.public_download_dir else None
+        strict_count_compatible = download_public_flickr8k_release(
+            data_root,
+            public_download_dir,
+        )
+        validate(data_root, strict=(not args.no_strict and strict_count_compatible))
+        return
 
     if args.download_kaggle:
         download_dir = Path(args.kaggle_download_dir)

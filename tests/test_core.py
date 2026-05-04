@@ -8,7 +8,7 @@ from models import Attention, Decoder, Encoder
 from train import doubly_stochastic_attention_loss
 from utils import Vocabulary, compute_bleu, tokenize_caption
 from utils.dataset import LengthBucketSampler
-from scripts.colab_setup import generate_split_files
+from scripts.colab_setup import generate_split_files, normalize_flickr8k
 
 
 def test_tokenizer_and_vocab_strip_punctuation():
@@ -89,12 +89,8 @@ def test_doubly_stochastic_loss_sums_regions_then_averages_batch():
 
     loss = doubly_stochastic_attention_loss(alphas, weight=1.0)
 
-<<<<<<< Updated upstream
-    # Region 0 sums to 1, the other 3 regions sum to 0 for each sample.
-=======
     # Location 0 sums to 1 -> penalty 0; locations 1-3 sum to 0 -> penalty 1 each.
     # Eq. 14 sums over locations and this implementation averages over batch.
->>>>>>> Stashed changes
     assert loss.item() == pytest.approx(3.0)
 
 
@@ -151,3 +147,31 @@ def test_colab_split_generation_uses_paper_counts_when_possible(tmp_path):
         "Flickr_8k.devImages.txt": 1000,
         "Flickr_8k.testImages.txt": 1000,
     }
+
+
+def test_colab_setup_converts_official_token_file(tmp_path):
+    source = tmp_path / "source"
+    image_dir = source / "Flicker8k_Dataset"
+    image_dir.mkdir(parents=True)
+    for i in range(101):
+        (image_dir / f"image_{i:04d}.jpg").touch()
+
+    (source / "Flickr8k.token.txt").write_text(
+        "image_0000.jpg#0\tA dog runs.\n"
+        "image_0000.jpg#1\tA dog plays.\n"
+    )
+    for name in (
+        "Flickr_8k.trainImages.txt",
+        "Flickr_8k.devImages.txt",
+        "Flickr_8k.testImages.txt",
+    ):
+        (source / name).write_text("image_0000.jpg\n")
+
+    data_root = tmp_path / "data" / "flickr8k"
+    normalize_flickr8k(source, data_root, use_symlink=False, require_official_splits=True)
+
+    assert (data_root / "images" / "image_0000.jpg").exists()
+    assert (data_root / "captions.txt").read_text().splitlines() == [
+        "image_0000.jpg\tA dog runs.",
+        "image_0000.jpg\tA dog plays.",
+    ]
