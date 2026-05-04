@@ -3,6 +3,7 @@ Training script for the VQA yes/no model.
 
 Usage:
     python -m vqa.train
+    python -m vqa.train --lr 1e-3 --dropout 0.3 --tag lr1e3
 
 Key features that mirror the caption train.py:
   - Adam optimiser, ReduceLROnPlateau on val accuracy
@@ -13,6 +14,7 @@ Key features that mirror the caption train.py:
   - Best checkpoint saved to checkpoints_vqa/best.pt
 """
 
+import argparse
 import csv
 import os
 import time
@@ -56,12 +58,6 @@ from vqa.model import VQAModel
 # ---------------------------------------------------------------------------
 
 def doubly_stochastic_loss(alphas: torch.Tensor, weight: float = LAMBDA) -> torch.Tensor:
-    """
-    Eq. 14 adapted for single-step attention.
-    With one attention step Σ_t α_ti = α_i which is already a valid softmax,
-    so this term is always 0 in the single-step case.  Kept for correctness if
-    multi-step attention is added later.
-    """
     # alphas: (B, L)  — already sums to 1, so this is 0 by construction.
     return weight * ((1.0 - alphas.sum(dim=1)) ** 2).mean()
 
@@ -70,7 +66,7 @@ def doubly_stochastic_loss(alphas: torch.Tensor, weight: float = LAMBDA) -> torc
 # Train / validate
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, loader, optimizer, criterion, device, epoch, fine_tune_encoder=False):
+def train_epoch(model, loader, optimizer, criterion, device, epoch, grad_clip, fine_tune_encoder=False):
     model.train()
     total_loss = 0.0
     correct = 0
@@ -93,7 +89,7 @@ def train_epoch(model, loader, optimizer, criterion, device, epoch, fine_tune_en
         loss.backward()
         nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad],
-            GRAD_CLIP,
+            grad_clip,
         )
         optimizer.step()
 
@@ -134,12 +130,40 @@ def validate(model, loader, criterion, device):
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+def main(cfg: dict | None = None):
+    """
+    Train the VQA model.
 
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+    cfg: optional dict of overrides for any config value. Supported keys:
+        lr, encoder_lr, dropout, batch_size, num_epochs, patience,
+        grad_clip, encoder_finetune_epoch, checkpoint_dir, results_dir, tag
+    """
+    c = cfg or {}
+
+    lr                    = c.get("lr",                    LEARNING_RATE)
+    encoder_lr            = c.get("encoder_lr",            ENCODER_LR)
+    dropout               = c.get("dropout",               DROPOUT)
+    batch_size            = c.get("batch_size",            BATCH_SIZE)
+    num_epochs            = c.get("num_epochs",            NUM_EPOCHS)
+    patience              = c.get("patience",              PATIENCE)
+    grad_clip             = c.get("grad_clip",             GRAD_CLIP)
+    encoder_finetune_ep   = c.get("encoder_finetune_epoch", ENCODER_FINETUNE_EPOCH)
+    tag                   = c.get("tag",                   "")
+
+    # Separate output dirs per run so sweeps don't overwrite each other
+    suffix        = f"_{tag}" if tag else ""
+    checkpoint_dir = c.get("checkpoint_dir", CHECKPOINT_DIR) + suffix
+    results_dir    = c.get("results_dir",    RESULTS_DIR)    + suffix
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n{'='*60}")
+    print(f"Run: {tag or 'vanilla'}")
+    print(f"  lr={lr}  encoder_lr={encoder_lr}  dropout={dropout}  batch_size={batch_size}")
+    print(f"  Device: {device}")
+    print(f"{'='*60}")
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(results_dir,    exist_ok=True)
 
     # --- Vocabulary ---
     if os.path.exists(VOCAB_PATH):
@@ -150,15 +174,14 @@ def main():
         vocab = build_and_save_vocab(DATA_ROOT, VOCAB_PATH, max_size=VOCAB_SIZE)
 
     # --- Dataloaders ---
-    print("Building dataloaders …")
     train_loader = get_vqa_dataloader(
         DATA_ROOT, vocab, "train",
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         max_question_len=MAX_QUESTION_LEN,
     )
     val_loader = get_vqa_dataloader(
         DATA_ROOT, vocab, "val",
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         max_question_len=MAX_QUESTION_LEN,
     )
     print(f"  Train batches: {len(train_loader)}  |  Val batches: {len(val_loader)}")
@@ -170,41 +193,39 @@ def main():
         gru_dim=GRU_DIM,
         attention_dim=ATTENTION_DIM,
         encoder_dim=ENCODER_DIM,
-        dropout=DROPOUT,
+        dropout=dropout,
         fine_tune_encoder=False,
     ).to(device)
 
     # --- Optimiser ---
-    # Only train non-encoder params initially; encoder is frozen.
     decoder_params = [
         p for name, p in model.named_parameters()
         if p.requires_grad and not name.startswith("encoder.")
     ]
-    optimizer = torch.optim.Adam(decoder_params, lr=LEARNING_RATE)
+    optimizer = torch.optim.Adam(decoder_params, lr=lr)
     scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
     criterion = nn.BCEWithLogitsLoss()
 
     # --- Training loop ---
     best_val_acc = 0.0
     epochs_no_improve = 0
-    log_path = os.path.join(RESULTS_DIR, "training_log.csv")
+    log_path = os.path.join(results_dir, "training_log.csv")
 
     with open(log_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "lr"])
 
-    for epoch in range(1, NUM_EPOCHS + 1):
-        # Enable encoder fine-tuning after warm-up
-        if epoch == ENCODER_FINETUNE_EPOCH + 1:
+    for epoch in range(1, num_epochs + 1):
+        if epoch == encoder_finetune_ep + 1:
             model.encoder._enable_fine_tune()
             encoder_params = [p for p in model.encoder.parameters() if p.requires_grad]
-            optimizer.add_param_group({"params": encoder_params, "lr": ENCODER_LR})
+            optimizer.add_param_group({"params": encoder_params, "lr": encoder_lr})
             print(f"Epoch {epoch}: encoder fine-tuning enabled.")
 
         t0 = time.time()
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, epoch,
-            fine_tune_encoder=(epoch > ENCODER_FINETUNE_EPOCH),
+            model, train_loader, optimizer, criterion, device, epoch, grad_clip,
+            fine_tune_encoder=(epoch > encoder_finetune_ep),
         )
         val_loss, val_acc = validate(model, val_loader, criterion, device)
         elapsed = time.time() - t0
@@ -213,7 +234,7 @@ def main():
         scheduler.step(val_acc)
 
         print(
-            f"Epoch {epoch:3d}/{NUM_EPOCHS} | "
+            f"Epoch {epoch:3d}/{num_epochs} | "
             f"train loss {train_loss:.4f} acc {train_acc:.4f} | "
             f"val loss {val_loss:.4f} acc {val_acc:.4f} | "
             f"lr {current_lr:.2e} | {elapsed:.0f}s"
@@ -225,30 +246,44 @@ def main():
                  f"{val_loss:.6f}", f"{val_acc:.6f}", f"{current_lr:.2e}"]
             )
 
-        # Checkpoint every epoch
         ckpt = {
-            "epoch": epoch,
-            "model_state": model.state_dict(),
+            "epoch":          epoch,
+            "model_state":    model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
-            "val_acc": val_acc,
-            "vocab_size": len(vocab),
+            "val_acc":        val_acc,
+            "vocab_size":     len(vocab),
+            "cfg":            c,
         }
-        torch.save(ckpt, os.path.join(CHECKPOINT_DIR, f"epoch_{epoch:03d}.pt"))
+        torch.save(ckpt, os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt"))
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             epochs_no_improve = 0
-            torch.save(ckpt, os.path.join(CHECKPOINT_DIR, "best.pt"))
+            torch.save(ckpt, os.path.join(checkpoint_dir, "best.pt"))
             print(f"  → New best val acc: {best_val_acc:.4f}")
         else:
             epochs_no_improve += 1
-            if epochs_no_improve >= PATIENCE:
-                print(f"Early stopping after {PATIENCE} epochs with no improvement.")
+            if epochs_no_improve >= patience:
+                print(f"Early stopping after {patience} epochs with no improvement.")
                 break
 
     print(f"\nTraining complete. Best val acc: {best_val_acc:.4f}")
-    print(f"Best checkpoint: {os.path.join(CHECKPOINT_DIR, 'best.pt')}")
+    print(f"Best checkpoint: {os.path.join(checkpoint_dir, 'best.pt')}")
+    return best_val_acc
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lr",                    type=float, default=None)
+    parser.add_argument("--encoder_lr",            type=float, default=None)
+    parser.add_argument("--dropout",               type=float, default=None)
+    parser.add_argument("--batch_size",            type=int,   default=None)
+    parser.add_argument("--num_epochs",            type=int,   default=None)
+    parser.add_argument("--patience",              type=int,   default=None)
+    parser.add_argument("--grad_clip",             type=float, default=None)
+    parser.add_argument("--encoder_finetune_epoch", type=int,  default=None)
+    parser.add_argument("--tag",                   type=str,   default="")
+    args = parser.parse_args()
+
+    cfg = {k: v for k, v in vars(args).items() if v is not None}
+    main(cfg if cfg else None)
