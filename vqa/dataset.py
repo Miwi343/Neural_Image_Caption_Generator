@@ -204,7 +204,21 @@ class VQAYesNoDataset(Dataset):
             data_root,
             f"v2_OpenEnded_mscoco_{coco_split}2014_questions.json",
         )
-        self.pairs = _load_yes_no_pairs(ann_path, q_path)
+        all_pairs = _load_yes_no_pairs(ann_path, q_path)
+
+        # Filter to pairs whose image file is actually present on disk.
+        # The notebook only downloads ~90% of images to save Drive space,
+        # so some image IDs will be missing.
+        coco_split_name = "train" if split == "train" else "val"
+        self.pairs = [
+            p for p in all_pairs
+            if os.path.exists(_coco_image_path(self.images_dir, coco_split_name, p[0]))
+        ]
+        if len(self.pairs) < len(all_pairs):
+            print(
+                f"[VQAYesNoDataset/{split}] {len(self.pairs):,} / {len(all_pairs):,} "
+                f"pairs kept ({len(all_pairs) - len(self.pairs):,} missing images skipped)"
+            )
 
         if max_samples is not None:
             self.pairs = self.pairs[:max_samples]
