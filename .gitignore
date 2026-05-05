@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 data/flickr8k/captions.txt
+data/flickr8k/Flickr_8k.devImages.txt
+data/flickr8k/Flickr_8k.testImages.txt
+data/flickr8k/Flickr_8k.trainImages.txt
