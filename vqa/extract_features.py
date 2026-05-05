@@ -1,15 +1,19 @@
 """
 Pre-extract VGG-16 features for all COCO images used by VQA yes/no training.
 
-Saves two files:
-    data/vqa/features_train2014.pt  ->  dict[image_id (int): tensor (196, 512)]
-    data/vqa/features_val2014.pt    ->  dict[image_id (int): tensor (196, 512)]
+Saves sharded feature files to avoid OOM during extraction and merging:
+    data/vqa/features_train2014/chunk_0000.pt
+    data/vqa/features_train2014/chunk_0001.pt
+    ...
+    data/vqa/features_val2014/chunk_0000.pt
+    ...
 
-Back both up to Drive so they survive session resets.
-Run once; takes ~30-60 min on GPU but training epochs then take ~2-3 min each.
+Each shard is a dict[int, Tensor(196, 512)].  VQAYesNoDataset reads shards
+lazily so no single load ever exceeds ~800 MB.
 """
 
 import os
+import shutil
 from pathlib import Path
 
 import torch
@@ -25,6 +29,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 DATA_ROOT   = "data/vqa"
 IMAGES_DIR  = os.path.join(DATA_ROOT, "images")
 DRIVE_CACHE = Path("/content/drive/MyDrive/vqa_results/data/vqa")
+
+CHUNK_SIZE = 2000  # images per shard (~800 MB each at float32)
 
 _TRANSFORM = transforms.Compose([
     transforms.Resize(256),
@@ -53,26 +59,17 @@ class _ImageDataset(Dataset):
         return image_id, _TRANSFORM(img)
 
 
-_CHUNK_SIZE = 2000  # flush to disk every N images (~800 MB per chunk)
-
-
 def extract_split(split: str, device: torch.device, encoder: Encoder, batch_size: int = 64):
-    out_path = Path(DATA_ROOT) / f"features_{split}2014.pt"
-    if out_path.exists():
-        print(f"[extract] {out_path} already exists — skipping.")
+    shard_dir = Path(DATA_ROOT) / f"features_{split}2014"
+    if shard_dir.exists() and any(shard_dir.glob("chunk_*.pt")):
+        print(f"[extract] {shard_dir} already has shards — skipping.")
         return
 
-    img_dir = Path(IMAGES_DIR) / f"{split}2014"
-    image_ids = sorted(
-        int(p.stem.split("_")[-1])
-        for p in img_dir.glob("*.jpg")
-    )
+    img_dir   = Path(IMAGES_DIR) / f"{split}2014"
+    image_ids = sorted(int(p.stem.split("_")[-1]) for p in img_dir.glob("*.jpg"))
     print(f"[extract] {split}: {len(image_ids):,} images")
 
-    # Write features in chunks to avoid accumulating 8+ GB in RAM.
-    # Each chunk is saved as a separate .pt shard, then merged at the end.
-    chunk_dir = Path(DATA_ROOT) / f"_chunks_{split}2014"
-    chunk_dir.mkdir(parents=True, exist_ok=True)
+    shard_dir.mkdir(parents=True, exist_ok=True)
 
     ds     = _ImageDataset(image_ids, split)
     loader = DataLoader(ds, batch_size=batch_size, num_workers=2,
@@ -80,43 +77,35 @@ def extract_split(split: str, device: torch.device, encoder: Encoder, batch_size
 
     chunk: dict = {}
     chunk_idx   = 0
-    total_saved = 0
 
     encoder.eval()
     with torch.no_grad():
         for ids, imgs in tqdm(loader, desc=f"Extracting {split}"):
-            imgs  = imgs.to(device)
-            feats = encoder(imgs).cpu()   # (B, 196, 512) float32
+            feats = encoder(imgs.to(device)).cpu()   # (B, 196, 512) float32
             for iid, feat in zip(ids.tolist(), feats):
                 chunk[iid] = feat
-            if len(chunk) >= _CHUNK_SIZE:
-                shard = chunk_dir / f"chunk_{chunk_idx:04d}.pt"
-                torch.save(chunk, shard)
-                total_saved += len(chunk)
-                chunk_idx   += 1
-                chunk        = {}
+            if len(chunk) >= CHUNK_SIZE:
+                _save_shard(shard_dir, chunk_idx, chunk, split)
+                chunk_idx += 1
+                chunk = {}
 
     if chunk:
-        shard = chunk_dir / f"chunk_{chunk_idx:04d}.pt"
-        torch.save(chunk, shard)
-        total_saved += len(chunk)
+        _save_shard(shard_dir, chunk_idx, chunk, split)
 
-    # Merge all shards into a single file
-    print(f"[extract] Merging {chunk_idx + 1} shards …")
-    features = {}
-    for shard in sorted(chunk_dir.glob("chunk_*.pt")):
-        features.update(torch.load(shard, weights_only=True))
-        shard.unlink()
-    chunk_dir.rmdir()
+    # Back up shards to Drive
+    drive_dir = DRIVE_CACHE / shard_dir.name
+    drive_dir.mkdir(parents=True, exist_ok=True)
+    for shard in sorted(shard_dir.glob("chunk_*.pt")):
+        dest = drive_dir / shard.name
+        if not dest.exists():
+            shutil.copy2(shard, dest)
+    print(f"[extract] Backed up shards → {drive_dir}")
 
-    torch.save(features, out_path)
-    print(f"[extract] Saved {len(features):,} features → {out_path}")
 
-    drive_path = DRIVE_CACHE / out_path.name
-    DRIVE_CACHE.mkdir(parents=True, exist_ok=True)
-    import shutil
-    shutil.copy2(out_path, drive_path)
-    print(f"[extract] Backed up → {drive_path}")
+def _save_shard(shard_dir: Path, idx: int, chunk: dict, split: str):
+    path = shard_dir / f"chunk_{idx:04d}.pt"
+    torch.save(chunk, path)
+    print(f"[extract] Shard {idx:04d}: {len(chunk):,} features → {path}")
 
 
 def main():

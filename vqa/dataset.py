@@ -11,6 +11,7 @@ import json
 import os
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -105,6 +106,37 @@ def _coco_image_path(images_dir: str, split: str, image_id: int) -> str:
     return os.path.join(images_dir, f"{split}2014", f"COCO_{split}2014_{image_id:012d}.jpg")
 
 
+class _ShardedFeatures:
+    """Lazy-loading view over a directory of chunk_NNNN.pt shard files.
+
+    Builds an index (image_id -> shard path) on construction without loading
+    any tensor data.  Each shard is loaded on first access and cached in RAM,
+    so only the shards actually needed are ever resident at once.
+    """
+
+    def __init__(self, shard_dir: str):
+        self._shard_dir = Path(shard_dir)
+        self._cache: Dict[str, dict] = {}
+        # Build id -> shard mapping without loading tensors
+        self._id_to_shard: Dict[int, str] = {}
+        for shard_path in sorted(self._shard_dir.glob("chunk_*.pt")):
+            data = torch.load(shard_path, map_location="cpu", weights_only=True)
+            for iid in data:
+                self._id_to_shard[iid] = str(shard_path)
+            # data goes out of scope — not kept in RAM
+        print(f"[_ShardedFeatures] Indexed {len(self._id_to_shard):,} images "
+              f"across {len(set(self._id_to_shard.values()))} shards")
+
+    def __contains__(self, image_id: int) -> bool:
+        return image_id in self._id_to_shard
+
+    def __getitem__(self, image_id: int) -> torch.Tensor:
+        shard_path = self._id_to_shard[image_id]
+        if shard_path not in self._cache:
+            self._cache[shard_path] = torch.load(shard_path, map_location="cpu", weights_only=True)
+        return self._cache[shard_path][image_id]
+
+
 class VQAYesNoDataset(Dataset):
     def __init__(
         self,
@@ -125,17 +157,25 @@ class VQAYesNoDataset(Dataset):
         q_path   = os.path.join(data_root, f"v2_OpenEnded_mscoco_{coco_split}2014_questions.json")
         all_pairs = _load_yes_no_pairs(ann_path, q_path)
 
-        # Load pre-extracted VGG features if available (skips JPEG loading entirely)
-        feat_path = os.path.join(data_root, f"features_{coco_split}2014.pt")
-        if os.path.exists(feat_path):
-            print(f"[VQAYesNoDataset/{split}] Loading cached features from {feat_path} ...")
-            self.features: Optional[dict] = torch.load(feat_path, map_location="cpu", weights_only=True)
-            self.coco_split = coco_split
+        # Load pre-extracted VGG features if available (skips JPEG loading entirely).
+        # Supports both a single features_<split>2014.pt file and a sharded
+        # features_<split>2014/ directory of chunk_NNNN.pt files.
+        shard_dir  = os.path.join(data_root, f"features_{coco_split}2014")
+        single_pt  = os.path.join(data_root, f"features_{coco_split}2014.pt")
+        self.coco_split = coco_split
+
+        if os.path.isdir(shard_dir) and any(Path(shard_dir).glob("chunk_*.pt")):
+            self.features: Optional[dict] = _ShardedFeatures(shard_dir)
+            self.pairs = [p for p in all_pairs if p[0] in self.features]
+            print(f"[VQAYesNoDataset/{split}] {len(self.pairs):,} / {len(all_pairs):,} pairs "
+                  f"(sharded cache: {shard_dir})")
+        elif os.path.exists(single_pt):
+            print(f"[VQAYesNoDataset/{split}] Loading cached features from {single_pt} ...")
+            self.features = torch.load(single_pt, map_location="cpu", weights_only=True)
             self.pairs = [p for p in all_pairs if p[0] in self.features]
             print(f"[VQAYesNoDataset/{split}] {len(self.pairs):,} / {len(all_pairs):,} pairs with cached features")
         else:
             self.features = None
-            self.coco_split = coco_split
             self.pairs = [p for p in all_pairs if os.path.exists(_coco_image_path(self.images_dir, coco_split, p[0]))]
             kept, total = len(self.pairs), len(all_pairs)
             print(f"[VQAYesNoDataset/{split}] {kept:,} / {total:,} pairs kept ({total-kept:,} missing images skipped)")
