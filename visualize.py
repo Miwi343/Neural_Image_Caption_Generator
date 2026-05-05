@@ -13,6 +13,7 @@ Paper section 5.4:
 """
 
 import glob
+import json
 import math
 import os
 from typing import List, Optional
@@ -172,6 +173,125 @@ def visualize_attention(
 
 
 # ---------------------------------------------------------------------------
+# Sentence-level β visualization
+# ---------------------------------------------------------------------------
+
+def visualize_sentence_beta(
+    image_tensor: torch.Tensor,         # (3, 224, 224) normalised
+    caption_words: List[str],
+    betas: torch.Tensor,                # (num_steps,)
+    save_path: Optional[str] = None,
+    show: bool = False,
+    dpi: int = 150,
+    words_per_row: int = 8,
+) -> None:
+    """
+    Poster-friendly two-panel figure: image left, colored sentence right.
+
+    Each word is rendered as a chip colored by its β value via the coolwarm
+    colormap (blue = low β, model looked at image; red = high β, model relied
+    on the language-model sentinel). The β value is printed below each chip.
+    """
+    img_np    = _unnormalize(image_tensor)
+    betas_arr = np.array([float(b) for b in betas])
+    n         = len(caption_words)
+
+    cmap = plt.cm.coolwarm
+    norm = plt.Normalize(vmin=0.0, vmax=1.0)
+
+    # Pick the words_per_row (between 5 and the caller's max) that wastes the
+    # fewest empty slots on the last row, keeping captions compact.
+    best_wpr, best_waste = words_per_row, words_per_row
+    for wpr in range(5, words_per_row + 1):
+        waste = (-n) % wpr
+        if waste < best_waste:
+            best_waste, best_wpr = waste, wpr
+    words_per_row = best_wpr
+
+    n_text_rows = math.ceil(n / words_per_row)
+    fig_h = max(3.5, 1.8 + n_text_rows * 1.4)
+    fig_w = max(10, 1.6 * words_per_row + 4)   # scale width with columns
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(fig_w, fig_h * 1.3),
+        gridspec_kw={"width_ratios": [0.65, 2.2]},
+    )
+
+    # ── Left: image ──────────────────────────────────────────────────────────
+    axes[0].imshow(img_np)
+    axes[0].axis("off")
+    axes[0].set_title("Input Image", fontsize=14, pad=6)
+
+    # ── Right: word chips ────────────────────────────────────────────────────
+    ax = axes[1]
+    ax.set_xlim(0, words_per_row)
+    ax.set_ylim(-(n_text_rows - 0.3), 1.0)
+    ax.axis("off")
+    ax.set_title(
+        "Generated Caption  —  blue = visual attention  |  red = sentinel (language model)",
+        fontsize=12, pad=10,
+    )
+
+    for idx, (word, beta) in enumerate(zip(caption_words, betas_arr)):
+        col = idx % words_per_row
+        row = idx // words_per_row
+        x   = col + 0.5
+        y   = -row
+
+        bg_color = cmap(norm(beta))
+        # Pick text color by perceived luminance of background
+        lum = 0.299 * bg_color[0] + 0.587 * bg_color[1] + 0.114 * bg_color[2]
+        text_color = "white" if lum < 0.50 else "black"
+
+        ax.text(
+            x, y + 0.15, word,
+            ha="center", va="center", fontsize=16, fontweight="bold",
+            color=text_color,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor=bg_color,
+                      edgecolor="none", alpha=0.92),
+            zorder=3,
+        )
+        ax.text(
+            x, y - 0.30, f"β={beta:.2f}",
+            ha="center", va="center", fontsize=10, color="#555555",
+        )
+
+    sm   = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, orientation="vertical", fraction=0.04, pad=0.02)
+    cbar.set_label("β  (sentinel weight)", fontsize=11)
+    cbar.ax.tick_params(labelsize=9)
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.savefig(save_path, dpi=dpi, bbox_inches="tight")
+        print(f"Saved sentence figure → {save_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def _save_caption_json(
+    img_name: str,
+    caption_words: List[str],
+    betas: torch.Tensor,
+    lam: float,
+    output_dir: str,
+) -> None:
+    """Save caption + per-word β values as JSON for cross-lambda comparison."""
+    data = {
+        "image":   img_name,
+        "lam":     lam,
+        "caption": caption_words,
+        "betas":   [round(float(b), 4) for b in betas],
+    }
+    path = os.path.join(output_dir, f"{img_name}_caption.json")
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
 # End-to-end helper
 # ---------------------------------------------------------------------------
 
@@ -184,6 +304,9 @@ def run_visualization(
     dpi: int = 200,
     sigma: float = 8.0,
     overlay_style: str = "paper",
+    also_sentence: bool = False,
+    save_json: bool = False,
+    lam: float = 1.0,
 ):
     """
     Load a checkpoint, generate captions, and save attention figures for each
@@ -260,6 +383,16 @@ def run_visualization(
             overlay_style=overlay_style,
         )
 
+        if also_sentence and betas is not None:
+            sent_path = os.path.join(output_dir, f"{img_name}_sentence.png")
+            visualize_sentence_beta(
+                img_tensor.cpu(), words, betas,
+                save_path=sent_path, show=False, dpi=dpi,
+            )
+
+        if save_json and betas is not None:
+            _save_caption_json(img_name, words, betas, lam, output_dir)
+
 
 def expand_image_inputs(inputs: Optional[List[str]]) -> List[str]:
     """Expand explicit image paths, directories, and glob patterns."""
@@ -297,6 +430,12 @@ if __name__ == "__main__":
     parser.add_argument("--dpi", type=int, default=200)
     parser.add_argument("--sigma", type=float, default=8.0)
     parser.add_argument("--overlay_style", default="paper", choices=["paper", "heatmap"])
+    parser.add_argument("--also_sentence", action="store_true",
+                        help="Also save a sentence-level β coloring figure per image")
+    parser.add_argument("--save_json", action="store_true",
+                        help="Save caption + β values as JSON (for cross-lambda comparison)")
+    parser.add_argument("--lam", type=float, default=1.0,
+                        help="Lambda value used for training (stored in JSON metadata)")
     args = parser.parse_args()
 
     image_paths = expand_image_inputs(args.images)
@@ -315,4 +454,7 @@ if __name__ == "__main__":
         dpi=args.dpi,
         sigma=args.sigma,
         overlay_style=args.overlay_style,
+        also_sentence=args.also_sentence,
+        save_json=args.save_json,
+        lam=args.lam,
     )

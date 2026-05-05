@@ -12,6 +12,7 @@ All hyperparameters, loss functions, scheduling, and early-stopping logic
 are identical to train.py so results are directly comparable.
 """
 
+import argparse
 import csv
 import os
 import time
@@ -68,7 +69,7 @@ def doubly_stochastic_attention_loss(alphas: torch.Tensor, weight: float = LAMBD
 
 
 def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoch,
-                fine_tune_encoder=False):
+                fine_tune_encoder=False, lam=LAMBDA):
     """
     Run one training epoch.
 
@@ -110,7 +111,7 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
             targets.reshape(-1),
         )
 
-        loss_ds = doubly_stochastic_attention_loss(alphas, LAMBDA)
+        loss_ds = doubly_stochastic_attention_loss(alphas, lam)
         loss    = loss_ce + loss_ds
 
         optimizer.zero_grad()
@@ -140,7 +141,7 @@ def validate(encoder, decoder, dataloader, vocab, device):
     hypotheses = []
     references = []
 
-    for images, captions, lengths, all_caps in tqdm(dataloader, desc="[val]", leave=False):
+    for images, _, _, all_caps in tqdm(dataloader, desc="[val]", leave=False):
         images = images.to(device)
         encoder_out = encoder(images)
         batch_size  = images.size(0)
@@ -158,8 +159,16 @@ def validate(encoder, decoder, dataloader, vocab, device):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lam", type=float, default=LAMBDA,
+                        help="Weight for doubly-stochastic attention loss (default: config.LAMBDA)")
+    args = parser.parse_args()
+    lam = args.lam
+    lam_tag = f"lam{lam:g}"
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Lambda (DS loss weight): {lam}")
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -202,7 +211,7 @@ def main():
     epochs_no_improve = 0
     fine_tune_encoder = False
 
-    log_path = os.path.join(RESULTS_DIR, "training_log_adaptive.csv")
+    log_path = os.path.join(RESULTS_DIR, f"training_log_adaptive_{lam_tag}.csv")
     with open(log_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -224,7 +233,7 @@ def main():
         t0 = time.time()
         train_loss, mean_beta = train_epoch(
             encoder, decoder, train_loader, optimizer, criterion, device, epoch,
-            fine_tune_encoder=fine_tune_encoder,
+            fine_tune_encoder=fine_tune_encoder, lam=lam,
         )
         val_scores = validate(encoder, decoder, val_loader, vocab, device)
         val_bleu4  = val_scores["bleu4"]
@@ -252,7 +261,7 @@ def main():
             ])
 
         # Checkpoint — include model_type so evaluate.py / visualize.py auto-detect
-        ckpt_path = os.path.join(CHECKPOINT_DIR, f"adaptive_epoch_{epoch:03d}.pt")
+        ckpt_path = os.path.join(CHECKPOINT_DIR, f"adaptive_epoch_{epoch:03d}_{lam_tag}.pt")
         torch.save({
             "epoch":      epoch,
             "model_type": "adaptive",
@@ -271,12 +280,13 @@ def main():
             torch.save({
                 "epoch":      epoch,
                 "model_type": "adaptive",
+                "lam":        lam,
                 "decoder":    decoder.state_dict(),
                 "encoder":    encoder.state_dict(),
                 "val_scores": val_scores,
                 "val_bleu4":  val_bleu4,
                 "vocab_size": len(vocab),
-            }, os.path.join(CHECKPOINT_DIR, "adaptive_best.pt"))
+            }, os.path.join(CHECKPOINT_DIR, f"adaptive_best_{lam_tag}.pt"))
             print(f"  -> New best BLEU-4: {best_bleu4*100:.2f}")
         else:
             epochs_no_improve += 1

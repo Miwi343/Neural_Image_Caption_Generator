@@ -1,0 +1,11 @@
+{
+  "checkpoint": "checkpoints/adaptive_best.pt",
+  "split": "test",
+  "beam_width": 1,
+  "scores": {
+    "bleu1": 0.6237264316664715,
+    "bleu2": 0.43602883928637315,
+    "bleu3": 0.2905943590472594,
+    "bleu4": 0.1880051822543741
+  }
+}

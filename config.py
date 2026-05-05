@@ -1,5 +1,7 @@
 """Project hyperparameters for the Flickr8k soft-attention reproduction."""
 
+import os
+
 EMBED_DIM = 512
 DECODER_DIM = 512
 ATTENTION_DIM = 512
@@ -17,7 +19,7 @@ NUM_EPOCHS = 50
 PATIENCE = 10              # More patience now that LR decay can rescue plateaus
 MAX_DECODE_LEN = 50
 
-DATA_ROOT = "data/flickr8k"
-VOCAB_PATH = "data/flickr8k/vocab.json"
+DATA_ROOT  = os.environ.get("FLICKR8K_ROOT", "data/flickr8k")
+VOCAB_PATH = os.path.join(DATA_ROOT, "vocab.json")
 CHECKPOINT_DIR = "checkpoints"
 RESULTS_DIR = "results"
