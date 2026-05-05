@@ -16,6 +16,7 @@ import os
 import random as _random
 import shutil
 import subprocess
+import sys
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -328,6 +329,12 @@ def main():
 
     repo_dir = Path(args.repo_dir).expanduser().resolve()
     data_root = (repo_dir / args.data_root).resolve()
+
+    # Ensure the repo root is importable even when this script is executed as
+    # `python scripts/colab_setup.py ...` (sys.path[0] would be `scripts/`).
+    repo_dir_str = str(repo_dir)
+    if repo_dir_str not in sys.path:
+        sys.path.insert(0, repo_dir_str)
 
     if args.download_public_flickr8k:
         download_dir = Path(args.public_download_dir)
