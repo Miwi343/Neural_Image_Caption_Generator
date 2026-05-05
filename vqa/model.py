@@ -82,7 +82,12 @@ class VQAModel(nn.Module):
         )
 
     def forward(self, images, questions, q_lens):
-        encoder_out = self.encoder(images)                       # (B, 196, 512)
+        # images is (B, 3, 224, 224) when loading JPEGs, or (B, 196, 512) when
+        # using pre-extracted features — skip the encoder in the latter case.
+        if images.dim() == 3:
+            encoder_out = images                  # (B, 196, 512) pre-extracted
+        else:
+            encoder_out = self.encoder(images)    # (B, 196, 512) from raw image
         q_vec       = self.question_encoder(questions, q_lens)   # (B, 512)
         z_hat, alpha = self.attention(encoder_out, q_vec)        # (B, 512), (B, 196)
         logit = self.classifier(torch.cat([z_hat, q_vec], dim=1)).squeeze(1)  # (B,)

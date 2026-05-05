@@ -125,9 +125,21 @@ class VQAYesNoDataset(Dataset):
         q_path   = os.path.join(data_root, f"v2_OpenEnded_mscoco_{coco_split}2014_questions.json")
         all_pairs = _load_yes_no_pairs(ann_path, q_path)
 
-        self.pairs = [p for p in all_pairs if os.path.exists(_coco_image_path(self.images_dir, coco_split, p[0]))]
-        kept, total = len(self.pairs), len(all_pairs)
-        print(f"[VQAYesNoDataset/{split}] {kept:,} / {total:,} pairs kept ({total-kept:,} missing images skipped)")
+        # Load pre-extracted VGG features if available (skips JPEG loading entirely)
+        feat_path = os.path.join(data_root, f"features_{coco_split}2014.pt")
+        if os.path.exists(feat_path):
+            print(f"[VQAYesNoDataset/{split}] Loading cached features from {feat_path} ...")
+            self.features: Optional[dict] = torch.load(feat_path, map_location="cpu", weights_only=True)
+            self.coco_split = coco_split
+            self.pairs = [p for p in all_pairs if p[0] in self.features]
+            print(f"[VQAYesNoDataset/{split}] {len(self.pairs):,} / {len(all_pairs):,} pairs with cached features")
+        else:
+            self.features = None
+            self.coco_split = coco_split
+            self.pairs = [p for p in all_pairs if os.path.exists(_coco_image_path(self.images_dir, coco_split, p[0]))]
+            kept, total = len(self.pairs), len(all_pairs)
+            print(f"[VQAYesNoDataset/{split}] {kept:,} / {total:,} pairs kept ({total-kept:,} missing images skipped)")
+            print(f"[VQAYesNoDataset/{split}] WARNING: no feature cache found — loading JPEGs each epoch (slow)")
 
         if max_samples is not None:
             self.pairs = self.pairs[:max_samples]
@@ -137,14 +149,16 @@ class VQAYesNoDataset(Dataset):
 
     def __getitem__(self, idx):
         image_id, question_str, label = self.pairs[idx]
-        coco_split = "train" if self.transform is _TRAIN_TRANSFORM else "val"
-        img_path = _coco_image_path(self.images_dir, coco_split, image_id)
 
-        try:
-            image = Image.open(img_path).convert("RGB")
-        except Exception:
-            image = Image.new("RGB", (224, 224))
-        image = self.transform(image)
+        if self.features is not None:
+            image = self.features[image_id]  # (196, 512) — already extracted
+        else:
+            img_path = _coco_image_path(self.images_dir, self.coco_split, image_id)
+            try:
+                image = Image.open(img_path).convert("RGB")
+            except Exception:
+                image = Image.new("RGB", (224, 224))
+            image = self.transform(image)
 
         ids = self.vocab.encode(question_str, max_len=self.max_q)
         q_len = len(ids)
