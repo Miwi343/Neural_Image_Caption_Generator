@@ -46,7 +46,7 @@ Download Flickr8k from Kaggle and arrange the files as:
 
 ```text
 data/flickr8k/
-  images/
+  images/  (or Images/)
   captions.txt
   Flickr_8k.trainImages.txt
   Flickr_8k.devImages.txt
@@ -111,7 +111,7 @@ python visualize.py \
 Or pass explicit images:
 
 ```bash
-python visualize.py --images data/flickr8k/images/123456.jpg
+python visualize.py --images data/flickr8k/images/123456.jpg  # or data/flickr8k/Images/...
 ```
 
 Each generated word gets a `14x14` attention map upsampled to `224x224`, Gaussian-smoothed, and overlaid on the input image.
@@ -128,54 +128,69 @@ The `soft-attention-ablations` branch adds a clean ablation framework. All defau
 |---|---|---|
 | `baseline_soft_attention` | *(no flags)* | Paper's exact model — use as the comparison anchor |
 | `no_attention_mean` | `--attention_mode none` | Does dynamic attention help vs. a static mean-pooled context? |
+| `uniform_attention` | `--attention_mode uniform` | Does *learned* spatial attention help vs. a uniform α=1/L baseline? |
 | `no_doubly_stochastic_lambda_0` | `--lambda_weight 0.0` | How much does the Eq. 14 regularisation penalty contribute? |
 | `no_beta_gate` | `--no_beta_gate` | Does the learned β scalar gate (paper Sec. 4.2.1) matter? |
 | `feature_grid_7x7` | `--feature_grid_size 7` | Does higher spatial resolution (L=196 vs. L=49) affect captioning? |
 
 ### Run individual experiments
 
-All outputs go to `results/ablation_results/<name>/`. Each run saves `config.json`, `training_log.csv`, `checkpoints/best.pt`, and `test_bleu.json`.
+All outputs go to `outputs/ablations/<name>/`. Each run saves `config.json`, `training_log.csv`, `checkpoints/best.pt`, and `eval_val.json` / `eval_test.json`.
 
 ```bash
 # a) Baseline (paper's exact model)
 python train.py \
-  --checkpoint_dir results/ablation_results/baseline_soft_attention/checkpoints \
-  --results_dir    results/ablation_results/baseline_soft_attention
+  --checkpoint_dir outputs/ablations/baseline_soft_attention/checkpoints \
+  --results_dir    outputs/ablations/baseline_soft_attention
 python evaluate.py \
-  --checkpoint  results/ablation_results/baseline_soft_attention/checkpoints/best.pt \
-  --results_out results/ablation_results/baseline_soft_attention/test_bleu.json
+  --checkpoint  outputs/ablations/baseline_soft_attention/checkpoints/best.pt \
+  --split test \
+  --results_out outputs/ablations/baseline_soft_attention/eval_test.json
 
 # b) No-attention mean baseline
 python train.py --attention_mode none \
-  --checkpoint_dir results/ablation_results/no_attention_mean/checkpoints \
-  --results_dir    results/ablation_results/no_attention_mean
+  --checkpoint_dir outputs/ablations/no_attention_mean/checkpoints \
+  --results_dir    outputs/ablations/no_attention_mean
 python evaluate.py --attention_mode none \
-  --checkpoint  results/ablation_results/no_attention_mean/checkpoints/best.pt \
-  --results_out results/ablation_results/no_attention_mean/test_bleu.json
+  --checkpoint  outputs/ablations/no_attention_mean/checkpoints/best.pt \
+  --split test \
+  --results_out outputs/ablations/no_attention_mean/eval_test.json
 
-# c) No doubly stochastic regularisation (λ=0)
+# c) Uniform-attention baseline
+python train.py --attention_mode uniform \
+  --checkpoint_dir outputs/ablations/uniform_attention/checkpoints \
+  --results_dir    outputs/ablations/uniform_attention
+python evaluate.py --attention_mode uniform \
+  --checkpoint  outputs/ablations/uniform_attention/checkpoints/best.pt \
+  --split test \
+  --results_out outputs/ablations/uniform_attention/eval_test.json
+
+# d) No doubly stochastic regularisation (λ=0)
 python train.py --lambda_weight 0.0 \
-  --checkpoint_dir results/ablation_results/no_doubly_stochastic_lambda_0/checkpoints \
-  --results_dir    results/ablation_results/no_doubly_stochastic_lambda_0
+  --checkpoint_dir outputs/ablations/no_doubly_stochastic_lambda_0/checkpoints \
+  --results_dir    outputs/ablations/no_doubly_stochastic_lambda_0
 python evaluate.py \
-  --checkpoint  results/ablation_results/no_doubly_stochastic_lambda_0/checkpoints/best.pt \
-  --results_out results/ablation_results/no_doubly_stochastic_lambda_0/test_bleu.json
+  --checkpoint  outputs/ablations/no_doubly_stochastic_lambda_0/checkpoints/best.pt \
+  --split test \
+  --results_out outputs/ablations/no_doubly_stochastic_lambda_0/eval_test.json
 
-# d) No beta gate
+# e) No beta gate
 python train.py --no_beta_gate \
-  --checkpoint_dir results/ablation_results/no_beta_gate/checkpoints \
-  --results_dir    results/ablation_results/no_beta_gate
+  --checkpoint_dir outputs/ablations/no_beta_gate/checkpoints \
+  --results_dir    outputs/ablations/no_beta_gate
 python evaluate.py --no_beta_gate \
-  --checkpoint  results/ablation_results/no_beta_gate/checkpoints/best.pt \
-  --results_out results/ablation_results/no_beta_gate/test_bleu.json
+  --checkpoint  outputs/ablations/no_beta_gate/checkpoints/best.pt \
+  --split test \
+  --results_out outputs/ablations/no_beta_gate/eval_test.json
 
-# e) 7×7 feature grid (L=49)
+# f) 7×7 feature grid (L=49)
 python train.py --feature_grid_size 7 \
-  --checkpoint_dir results/ablation_results/feature_grid_7x7/checkpoints \
-  --results_dir    results/ablation_results/feature_grid_7x7
+  --checkpoint_dir outputs/ablations/feature_grid_7x7/checkpoints \
+  --results_dir    outputs/ablations/feature_grid_7x7
 python evaluate.py --feature_grid_size 7 \
-  --checkpoint  results/ablation_results/feature_grid_7x7/checkpoints/best.pt \
-  --results_out results/ablation_results/feature_grid_7x7/test_bleu.json
+  --checkpoint  outputs/ablations/feature_grid_7x7/checkpoints/best.pt \
+  --split test \
+  --results_out outputs/ablations/feature_grid_7x7/eval_test.json
 ```
 
 Or use the runner script to print / execute all commands at once:
@@ -197,14 +212,15 @@ pytest tests/test_ablations.py -v
 ### Where results are saved
 
 ```text
-results/ablation_results/
+outputs/ablations/
   <experiment_name>/
     config.json          — args used for this run
     training_log.csv     — per-epoch train loss + val BLEU-1..4
     checkpoints/
       epoch_XXX.pt
       best.pt
-    test_bleu.json       — final BLEU-1..4 + METEOR on test split
+    eval_val.json        — BLEU-1..4 + METEOR + loss on val split
+    eval_test.json       — BLEU-1..4 + METEOR + loss on test split
 ```
 
 ### Suggested reporting table
@@ -213,27 +229,28 @@ results/ablation_results/
 |---|---|---|---|---|---|---|---|
 | baseline_soft_attention | | | | | | | Paper target: 67/44.8/29.9/19.5 |
 | no_attention_mean | | | | | | | Static mean context |
+| uniform_attention | | | | | | | α forced to 1/L |
 | no_doubly_stochastic_lambda_0 | | | | | | | λ=0, no Eq.14 penalty |
 | no_beta_gate | | | | | | | β forced to 1 |
 | feature_grid_7x7 | | | | | | | L=49 instead of 196 |
 
-Fill in from `results/ablation_results/<name>/test_bleu.json` after training each experiment.
+Fill in from `outputs/ablations/<name>/eval_val.json` and `outputs/ablations/<name>/eval_test.json` after training each experiment.
 
 ### Visualization with ablation models
 
 ```bash
 # Works for all modes except 'none' (which produces a flat/uniform overlay)
 python visualize.py \
-  --checkpoint results/ablation_results/<name>/checkpoints/best.pt \
+  --checkpoint outputs/ablations/<name>/checkpoints/best.pt \
   --attention_mode <mode> \       # match training flag
   --feature_grid_size <14 or 7>  # match training flag
   --output_dir results/<name>_attention
 
 # For no_beta_gate
 python visualize.py \
-  --checkpoint results/ablation_results/no_beta_gate/checkpoints/best.pt \
+  --checkpoint outputs/ablations/no_beta_gate/checkpoints/best.pt \
   --no_beta_gate \
   --output_dir results/no_beta_gate_attention
 ```
 
-For `attention_mode=none`, visualization still runs but produces uniform/flat overlays (annotated in the figure). This is the correct and expected behaviour — no spatial attention was used during decoding.
+For `attention_mode=none` and `attention_mode=uniform`, visualization still runs but produces uniform/flat overlays (annotated in the figure). This is the correct and expected behaviour — either no spatial attention was used during decoding, or α was forced to be uniform.

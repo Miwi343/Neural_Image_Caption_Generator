@@ -27,7 +27,7 @@ RESULTS_DIR = "results"
 # Pass different values via CLI args in train.py / evaluate.py to run ablations.
 # ---------------------------------------------------------------------------
 
-# Attention mode: "soft" (paper default) | "none"
+# Attention mode: "soft" (default) | "uniform" | "none"
 ATTENTION_MODE = "soft"
 
 # Beta gate: True = learned scalar gate (paper default); False = force β=1

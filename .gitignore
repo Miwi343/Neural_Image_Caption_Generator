@@ -1,7 +1,17 @@
-data/flickr8k/images/
-data/flickr8k/vocab.json
-checkpoints/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-data/flickr8k/captions.txt
+
+# Training artifacts
+checkpoints/
+results/**
+!results/**/
+!results/**/.gitkeep
+outputs/
+
+# Flickr8k dataset (kept local; do not commit)
+data/flickr8k/**
+!data/flickr8k/**/
+!data/flickr8k/**/.gitkeep
+
+.pytest_cache/

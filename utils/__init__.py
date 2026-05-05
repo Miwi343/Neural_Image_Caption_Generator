@@ -3,6 +3,7 @@ from utils.dataset import (
     Vocabulary,
     get_dataloader,
     load_flickr8k_captions,
+    resolve_images_dir,
     tokenize_caption,
     validate_dataset_layout,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "Vocabulary",
     "get_dataloader",
     "load_flickr8k_captions",
+    "resolve_images_dir",
     "tokenize_caption",
     "validate_dataset_layout",
     "compute_bleu",

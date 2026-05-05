@@ -82,6 +82,7 @@ def _make_decoder(attention_mode: str = "soft", use_beta_gate: bool = True) -> D
 SMOKE_CONFIGS = [
     ("baseline_soft_attention",       "soft",    True,  196, 1.0),
     ("no_attention_mean",             "none",    True,  196, 1.0),
+    ("uniform_attention",             "uniform", True,  196, 1.0),
     ("no_doubly_stochastic_lambda_0", "soft",    True,  196, 0.0),
     ("no_beta_gate",                  "soft",    False, 196, 1.0),
     ("feature_grid_7x7",              "soft",    True,   49, 1.0),
@@ -141,6 +142,23 @@ def test_none_attention_returns_uniform_placeholder_alpha():
     """
     L = 196
     decoder = _make_decoder(attention_mode="none")
+    encoder_out = _fake_encoder_out(1, L)
+    h = torch.zeros(1, TINY.decoder_dim)
+    c = torch.zeros(1, TINY.decoder_dim)
+    prev = torch.tensor([1])
+
+    _, _, _, alpha, _ = decoder.decode_step(encoder_out, prev, h, c)
+
+    expected = torch.full((1, L), 1.0 / L)
+    assert torch.allclose(alpha, expected, atol=1e-6)
+
+
+def test_uniform_attention_forces_uniform_alpha():
+    """
+    In 'uniform' mode alpha is forced to 1/L even though the attention MLP exists.
+    """
+    L = 196
+    decoder = _make_decoder(attention_mode="uniform")
     encoder_out = _fake_encoder_out(1, L)
     h = torch.zeros(1, TINY.decoder_dim)
     c = torch.zeros(1, TINY.decoder_dim)

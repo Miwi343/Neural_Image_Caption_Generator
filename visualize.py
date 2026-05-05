@@ -12,9 +12,10 @@ Paper section 5.4:
    works identically for 7×7 via bilinear interpolation with a fixed target.)
 
 Ablation notes:
-  - none attention: the returned alpha is a 1/L placeholder.
-    Visualization shows a flat, featureless overlay — this is the expected and
-    correct behaviour (the model used no spatial attention during decoding).
+  - none/uniform attention: the returned alpha is uniform (1/L).
+    Visualization shows a flat, featureless overlay — this is expected and
+    correct behaviour (either no spatial attention was used, or α was forced
+    to be uniform).
   - feature_grid_size=7: L=49, grid=7.  The upsample target stays 224×224.
   - All other ablation modes (no_beta_gate, lambda=0) produce normal alpha
     maps and work with this script without any special handling.
@@ -45,7 +46,7 @@ from config import (
     USE_BETA_GATE,
 )
 from models import Encoder, Decoder
-from utils import Vocabulary, greedy_decode, load_flickr8k_captions
+from utils import Vocabulary, greedy_decode, load_flickr8k_captions, resolve_images_dir
 
 # ---------------------------------------------------------------------------
 # ImageNet inverse transform for display
@@ -122,7 +123,7 @@ def visualize_attention(
     axes[0].axis("off")
 
     # Uniform / none modes produce flat maps — annotate the figure.
-    if attention_mode == "none":
+    if attention_mode in {"none", "uniform"}:
         flat_note = f"[{attention_mode} — uniform α shown]"
         fig.text(0.5, 0.01, flat_note, ha="center", fontsize=9, color="gray")
 
@@ -308,7 +309,7 @@ if __name__ == "__main__":
     # --- Ablation flags (must match the flags used during training) ---
     parser.add_argument(
         "--attention_mode",
-        choices=["soft", "none"],
+        choices=["soft", "uniform", "none"],
         default=ATTENTION_MODE,
         help="Must match the mode used when training the checkpoint.",
     )
@@ -330,8 +331,9 @@ if __name__ == "__main__":
     image_paths = expand_image_inputs(args.images)
     if not image_paths:
         image_to_caps = load_flickr8k_captions(args.data_root, args.split)
+        images_dir = resolve_images_dir(args.data_root)
         image_paths = [
-            os.path.join(args.data_root, "images", img_name)
+            os.path.join(images_dir, img_name)
             for img_name in sorted(image_to_caps.keys())[: args.num_examples]
         ]
 

@@ -10,7 +10,7 @@ Implements:
   - Batch length-bucketing for training speed (paper section 4.3)
 
 Ablation flags (all default to the paper's exact behaviour):
-  --attention_mode   soft | none
+  --attention_mode   soft | uniform | none
   --no_beta_gate     disable the learned β scalar gate (default: enabled)
   --lambda_weight    doubly stochastic regularisation weight (default: 1.0)
   --feature_grid_size  14 | 7  (spatial annotation resolution, default: 14)
@@ -190,9 +190,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # --- Ablation flags ---
     parser.add_argument(
         "--attention_mode",
-        choices=["soft", "none"],
+        choices=["soft", "uniform", "none"],
         default=ATTENTION_MODE,
-        help="Attention variant: 'soft' (default, paper) or 'none' (static mean context).",
+        help=(
+            "Attention variant: 'soft' (default), 'uniform' (force alpha=1/L), "
+            "or 'none' (static mean context, no attention MLP)."
+        ),
     )
     parser.add_argument(
         "--no_beta_gate",
@@ -403,6 +406,7 @@ def main(args=None):
             "attention_mode": args.attention_mode,
             "use_beta_gate": use_beta_gate,
             "feature_grid_size": args.feature_grid_size,
+            "lambda_weight": args.lambda_weight,
         }, ckpt_path)
 
         if val_bleu4 > best_bleu4:
@@ -419,6 +423,7 @@ def main(args=None):
                 "attention_mode": args.attention_mode,
                 "use_beta_gate": use_beta_gate,
                 "feature_grid_size": args.feature_grid_size,
+                "lambda_weight": args.lambda_weight,
             }, os.path.join(args.checkpoint_dir, "best.pt"))
             print(f"  -> New best BLEU-4: {best_bleu4*100:.2f}")
         else:

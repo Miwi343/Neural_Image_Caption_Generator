@@ -15,6 +15,10 @@ Key design choices that match the paper exactly:
 Ablation extensions (all default to the paper's exact behaviour):
   attention_mode : str
     "soft" — learned additive attention (default, paper Sec. 4.2).
+    "uniform" — force α_{t,i} = 1/L for all regions at every step. The attention
+                MLP is still executed (so parameterization matches the baseline),
+                but its output is ignored. This tests whether *learned* spatial
+                attention matters.
     "none" — replace the dynamic context vector with the static mean-pooled
              annotation (ẑ_t = mean_i a_i).  No attention MLP is called;
              a uniform α is returned as a placeholder for visualization.
@@ -36,7 +40,7 @@ import torch.nn as nn
 
 from models.attention import Attention
 
-VALID_ATTENTION_MODES = ("soft", "none")
+VALID_ATTENTION_MODES = ("soft", "uniform", "none")
 
 
 class Decoder(nn.Module):
@@ -66,7 +70,7 @@ class Decoder(nn.Module):
             vocab_size:      size of output vocabulary (K in the paper)
             encoder_dim:     annotation vector dim     (D in the paper, =512)
             dropout:         dropout probability applied before deep output
-            attention_mode:  "soft" | "none"  (default: "soft")
+            attention_mode:  "soft" | "uniform" | "none"  (default: "soft")
             use_beta_gate:   whether to apply the learned β scalar gate
                              (default: True, matches paper Sec. 4.2.1)
         """
@@ -140,6 +144,8 @@ class Decoder(nn.Module):
 
         attention_mode="soft":
             Learned additive attention (paper Eq. 4-6, 13).
+        attention_mode="uniform":
+            Force α to 1/L uniformly, but still execute the attention MLP.
         attention_mode="none":
             Static mean-pooled context ẑ = mean_i a_i; no attention MLP used.
             A uniform α is returned as a placeholder for visualization.
@@ -157,6 +163,13 @@ class Decoder(nn.Module):
 
         if self.attention_mode == "soft":
             z_hat, alpha = self.attention(encoder_out, h)
+
+        elif self.attention_mode == "uniform":
+            # Execute the MLP so the forward path still touches the attention
+            # parameters, but ignore its output and force a uniform map.
+            _ = self.attention(encoder_out, h)
+            z_hat = encoder_out.mean(dim=1)
+            alpha = torch.full((batch_size, L), 1.0 / L, device=encoder_out.device)
 
         else:  # "none"
             z_hat = encoder_out.mean(dim=1)

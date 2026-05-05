@@ -68,26 +68,53 @@ def _normalize_image_name(image_id: str) -> str:
     return os.path.basename(image_id.strip().split("#")[0])
 
 
+def resolve_images_dir(data_root: str) -> str:
+    """
+    Return the images directory path, accepting both `images/` and `Images/`.
+
+    Some Flickr8k distributions (and some users' local setups) use `Images/`
+    with a capital I.  Colab/Linux filesystems are typically case-sensitive,
+    so we resolve the directory explicitly instead of hardcoding one casing.
+    """
+    candidates = [
+        os.path.join(data_root, "images"),
+        os.path.join(data_root, "Images"),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    # Fall back to the canonical path for error messages.
+    return candidates[0]
+
+
 def validate_dataset_layout(data_root: str, strict_split_counts: bool = True) -> None:
     """
     Validate the expected Flickr8k/Karpathy directory layout before training.
 
     Expected tree:
         data/flickr8k/
-            images/
+            images/ (or Images/)
             captions.txt
             Flickr_8k.trainImages.txt
             Flickr_8k.devImages.txt
             Flickr_8k.testImages.txt
     """
+    images_dir = resolve_images_dir(data_root)
     expected = [
-        os.path.join(data_root, "images"),
+        images_dir,
         os.path.join(data_root, "captions.txt"),
         *[os.path.join(data_root, name) for name in SPLIT_FILE_MAP.values()],
     ]
     missing = [path for path in expected if not os.path.exists(path)]
     if missing:
-        layout = "\n".join(f"  - {path}" for path in expected)
+        # Show both acceptable image-dir spellings in the message.
+        expected_layout = [
+            os.path.join(data_root, "images"),
+            os.path.join(data_root, "Images"),
+            os.path.join(data_root, "captions.txt"),
+            *[os.path.join(data_root, name) for name in SPLIT_FILE_MAP.values()],
+        ]
+        layout = "\n".join(f"  - {path}" for path in expected_layout)
         missing_text = "\n".join(f"  - {path}" for path in missing)
         raise FileNotFoundError(
             "Flickr8k files are missing.\n"
@@ -353,7 +380,7 @@ class Flickr8kDataset(Dataset):
         self.split = split
         self.vocab = vocab
         self.transform = _TRAIN_TRANSFORM if split == "train" else _EVAL_TRANSFORM
-        self.image_dir = os.path.join(data_root, "images")
+        self.image_dir = resolve_images_dir(data_root)
 
         if self.vocab is None:
             raise ValueError("Flickr8kDataset requires a built Vocabulary.")

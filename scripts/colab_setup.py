@@ -6,6 +6,7 @@ This script is intentionally Colab-friendly:
   - auto-generates train/val/test split files when only images/ and captions.txt
     are present (the typical Kaggle download layout)
   - can download/unzip a Kaggle dataset when kaggle.json is available
+  - can optionally download a public Flickr8k mirror (images + captions + splits)
   - keeps checkpoints/results inside the repo folder in Drive
 """
 
@@ -15,6 +16,7 @@ import os
 import random as _random
 import shutil
 import subprocess
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -35,6 +37,13 @@ SPLIT_FILES = [
 # Val and test are fixed at 1000 each; training gets ALL remaining images.
 N_VAL  = 1000
 N_TEST = 1000
+
+# Public mirror used by the one-click Colab notebook as a fallback when the user
+# hasn't uploaded the dataset into Drive.
+PUBLIC_FLICKR8K_URLS = {
+    "Flickr8k_Dataset.zip": "https://github.com/jbrownlee/Datasets/releases/download/Flickr8k/Flickr8k_Dataset.zip",
+    "Flickr8k_text.zip": "https://github.com/jbrownlee/Datasets/releases/download/Flickr8k/Flickr8k_text.zip",
+}
 
 
 def run(cmd, cwd=None):
@@ -137,7 +146,12 @@ def generate_split_files(data_root: Path) -> bool:
     return wrote_any
 
 
-def normalize_flickr8k(source_dir: Path, data_root: Path, use_symlink: bool = True):
+def normalize_flickr8k(
+    source_dir: Path,
+    data_root: Path,
+    use_symlink: bool = True,
+    require_official_splits: bool = False,
+):
     """Normalize common Kaggle/official Flickr8k layouts into data/flickr8k.
 
     Handles two common layouts:
@@ -153,6 +167,12 @@ def normalize_flickr8k(source_dir: Path, data_root: Path, use_symlink: bool = Tr
         source_dir/
           images/
           captions.txt     (CSV with header: image,caption)
+
+    Also supports the common "Flickr8k.token.txt" mirror layout:
+        source_dir/
+          Flicker8k_Dataset/ or Flickr8k_Dataset/  (JPEG images)
+          Flickr8k.token.txt                       (tab-separated captions)
+          Flickr_8k.{train,dev,test}Images.txt
     """
     source_dir = source_dir.expanduser().resolve()
     data_root = data_root.expanduser().resolve()
@@ -182,11 +202,21 @@ def normalize_flickr8k(source_dir: Path, data_root: Path, use_symlink: bool = Tr
     copy_or_link(image_dir, data_root / "images", use_symlink=use_symlink)
 
     # ------------------------------------------------------------------
-    # 2. captions.txt — required; raise if missing
+    # 2. Captions — required; accept captions.txt or Flickr8k.token.txt.
+    # We always normalize to data_root/captions.txt for the rest of the repo.
     # ------------------------------------------------------------------
-    captions_src = find_first(source_dir, ["captions.txt"])
+    captions_src = find_first(
+        source_dir,
+        [
+            "captions.txt",
+            "Flickr8k.token.txt",
+            "flickr8k.token.txt",
+        ],
+    )
     if captions_src is None:
-        raise FileNotFoundError(f"Could not find captions.txt under {source_dir}.")
+        raise FileNotFoundError(
+            f"Could not find captions.txt or Flickr8k.token.txt under {source_dir}."
+        )
     copy_or_link(captions_src, data_root / "captions.txt", use_symlink=use_symlink)
 
     # ------------------------------------------------------------------
@@ -200,12 +230,21 @@ def normalize_flickr8k(source_dir: Path, data_root: Path, use_symlink: bool = Tr
     missing_splits = [f for f in SPLIT_FILES if not (data_root / f).exists()]
     splits_generated = False
     if missing_splits:
-        print(
-            "Split files not found in source directory — generating from captions.txt:\n  "
-            + "\n  ".join(missing_splits)
-        )
-        generate_split_files(data_root)
-        splits_generated = True
+        if require_official_splits:
+            missing = "\n  ".join(missing_splits)
+            raise FileNotFoundError(
+                "Official Flickr8k split files are required but missing:\n  "
+                f"{missing}\n"
+                "Provide the official split .txt files or run without "
+                "--require_official_splits to auto-generate splits from captions.txt."
+            )
+        else:
+            print(
+                "Split files not found in source directory — generating from captions.txt:\n  "
+                + "\n  ".join(missing_splits)
+            )
+            generate_split_files(data_root)
+            splits_generated = True
 
     print(f"\nFlickr8k is ready at {data_root}")
     print("Contents:")
@@ -218,6 +257,30 @@ def download_from_kaggle(dataset: str, download_dir: Path):
     ensure_dir(download_dir)
     run(["python", "-m", "pip", "install", "-q", "kaggle"])
     run(["kaggle", "datasets", "download", "-d", dataset, "-p", str(download_dir)])
+
+    for zip_path in download_dir.glob("*.zip"):
+        print(f"Unzipping {zip_path}")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(download_dir)
+
+
+def download_public_flickr8k(download_dir: Path) -> None:
+    """
+    Download a public Flickr8k mirror (images + text) and extract into download_dir.
+
+    This is a fallback path for Colab when the user hasn't provided the dataset.
+    """
+    ensure_dir(download_dir)
+
+    for filename, url in PUBLIC_FLICKR8K_URLS.items():
+        out = download_dir / filename
+        if out.exists():
+            print(f"{filename} already exists — skipping download")
+            continue
+
+        print(f"Downloading {filename} …")
+        with urllib.request.urlopen(url) as r, open(out, "wb") as f:
+            shutil.copyfileobj(r, f)
 
     for zip_path in download_dir.glob("*.zip"):
         print(f"Unzipping {zip_path}")
@@ -239,23 +302,38 @@ def main():
     parser.add_argument("--source_dir", default="")
     parser.add_argument("--download_kaggle", action="store_true")
     parser.add_argument(
+        "--download_public_flickr8k",
+        action="store_true",
+        help="Download a public Flickr8k mirror (jbrownlee/Datasets) and prepare it under data_root.",
+    )
+    parser.add_argument(
         "--kaggle_dataset",
         default="adityajn105/flickr8k",
         help="Kaggle dataset slug to download when --download_kaggle is set.",
     )
     parser.add_argument("--kaggle_download_dir", default="/content/kaggle_flickr8k")
+    parser.add_argument("--public_download_dir", default="/content/public_flickr8k")
     parser.add_argument("--copy", action="store_true", help="Copy files instead of symlinking.")
     parser.add_argument(
         "--no_strict",
         action="store_true",
         help="Skip exact split-count validation (useful when dataset size differs from standard 8000).",
     )
+    parser.add_argument(
+        "--require_official_splits",
+        action="store_true",
+        help="Require official Flickr8k split files (do not auto-generate splits).",
+    )
     args = parser.parse_args()
 
     repo_dir = Path(args.repo_dir).expanduser().resolve()
     data_root = (repo_dir / args.data_root).resolve()
 
-    if args.download_kaggle:
+    if args.download_public_flickr8k:
+        download_dir = Path(args.public_download_dir)
+        download_public_flickr8k(download_dir)
+        source_dir = download_dir
+    elif args.download_kaggle:
         download_dir = Path(args.kaggle_download_dir)
         download_from_kaggle(args.kaggle_dataset, download_dir)
         source_dir = download_dir
@@ -264,9 +342,19 @@ def main():
     else:
         source_dir = data_root
 
-    splits_generated = normalize_flickr8k(source_dir, data_root, use_symlink=not args.copy)
-    # Skip strict count check when we auto-generated splits (training size differs from 6000).
-    validate(data_root, strict=not (args.no_strict or splits_generated))
+    splits_generated = normalize_flickr8k(
+        source_dir,
+        data_root,
+        use_symlink=not args.copy,
+        require_official_splits=args.require_official_splits,
+    )
+    # Skip strict count check when we auto-generated splits (split differs from official 6000/1000/1000).
+    strict = not args.no_strict
+    if splits_generated:
+        strict = False
+    if args.require_official_splits:
+        strict = True
+    validate(data_root, strict=strict)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 """
 Ablation experiment runner for Show, Attend and Tell.
 
-Trains every ablation variant from scratch, then evaluates each with the full
-beam-width × length-normalisation sweep so results are directly comparable.
+Trains each requested ablation variant from scratch, then evaluates on
+validation and test splits. By default this script prints the plan only.
 
 Usage
 -----
@@ -26,30 +26,21 @@ Usage
 
 Outputs (per experiment)
 ------------------------
-    results/ablation_results/<name>/config.json
-    results/ablation_results/<name>/training_log.csv
-    results/ablation_results/<name>/checkpoints/best.pt
-    results/ablation_results/<name>/checkpoints/epoch_NNN.pt
-    results/ablation_results/<name>/eval_beam<N>_ln<bool>.json   (x5 per model)
+    outputs/ablations/<name>/config.json
+    outputs/ablations/<name>/training_log.csv
+    outputs/ablations/<name>/checkpoints/best.pt
+    outputs/ablations/<name>/checkpoints/epoch_NNN.pt
+    outputs/ablations/<name>/eval_val.json
+    outputs/ablations/<name>/eval_test.json
 
 Experiments
 -----------
-Architectural (require different model weights — cannot be applied to baseline):
-  no_attention       — mean-pooled static context, no spatial attention MLP
-  no_beta_gate       — β forced to 1 (removes learned scalar context gate)
-  feature_grid_7x7   — 7×7 feature maps (L=49) instead of 14×14 (L=196)
-
-Regularisation:
-  lambda_0           — λ=0, doubly stochastic regularisation fully disabled
-  lambda_0_5         — λ=0.5, softer regularisation than paper default (1.0)
-  lambda_2_0         — λ=2.0, stronger regularisation than paper default
-
-Encoder fine-tuning schedule:
-  finetune_ep3       — unlock encoder after epoch 3 (earlier than default 5)
-  finetune_ep10      — unlock encoder after epoch 10 (later than default 5)
-
-Combined:
-  lambda_0_5_finetune3 — λ=0.5 + encoder unlock at epoch 3
+  baseline_soft_attention         — default soft attention
+  no_attention_mean               — static mean context (no attention MLP)
+  uniform_attention               — force alpha=1/L at every step
+  no_doubly_stochastic_lambda_0   — lambda_weight=0
+  no_beta_gate                    — beta forced to 1
+  feature_grid_7x7                — 7×7 feature maps (L=49)
 """
 
 import argparse
@@ -63,89 +54,55 @@ from pathlib import Path
 # Experiment registry
 # ---------------------------------------------------------------------------
 
-BASE_OUT   = "results/ablation_results"
+BASE_OUT   = "outputs/ablations"
 DATA_ROOT  = "data/flickr8k"          # overridden by --data_root
 VOCAB_PATH = "data/flickr8k/vocab.json"  # overridden by --vocab
-
-EVAL_SWEEP = [
-    # (tag_suffix,          extra_eval_flags)
-    ("beam1_lnFalse",  []),
-    ("beam3_lnFalse",  ["--beam_width", "3"]),
-    ("beam5_lnFalse",  ["--beam_width", "5"]),
-    ("beam3_lnTrue",   ["--beam_width", "3", "--length_normalize"]),
-    ("beam5_lnTrue",   ["--beam_width", "5", "--length_normalize"]),
-]
 
 # Paper Flickr8k soft-attention numbers for comparison
 PAPER = {"bleu1": 67.0, "bleu2": 44.8, "bleu3": 29.9, "bleu4": 19.5, "meteor": 18.93}
 
 EXPERIMENTS = [
-    # ── Architectural ────────────────────────────────────────────────────────
     {
-        "name": "no_attention",
-        "description": "Mean-pooled static context; no spatial attention MLP (attention_mode=none).",
+        "name": "baseline_soft_attention",
+        "description": "Baseline: learned soft attention, beta gate enabled, 14x14 features, lambda=default.",
+        "group": "baseline",
+        "train_flags": [],
+        "eval_flags":  [],
+    },
+    {
+        "name": "no_attention_mean",
+        "description": "No attention: replace dynamic context with mean_i a_i at every timestep (attention_mode=none).",
         "group": "architectural",
         "train_flags": ["--attention_mode", "none"],
         "eval_flags":  ["--attention_mode", "none"],
     },
     {
+        "name": "uniform_attention",
+        "description": "Uniform attention: force alpha_{t,i}=1/L for all regions (attention_mode=uniform).",
+        "group": "architectural",
+        "train_flags": ["--attention_mode", "uniform"],
+        "eval_flags":  ["--attention_mode", "uniform"],
+    },
+    {
+        "name": "no_doubly_stochastic_lambda_0",
+        "description": "Disable doubly stochastic regularization by setting lambda_weight=0.",
+        "group": "regularisation",
+        "train_flags": ["--lambda_weight", "0.0"],
+        "eval_flags":  ["--lambda_weight", "0.0"],
+    },
+    {
         "name": "no_beta_gate",
-        "description": "Force β=1 at every step; removes learned scalar context gate (section 4.2.1).",
+        "description": "Disable beta gate by forcing beta_t=1 at every timestep.",
         "group": "architectural",
         "train_flags": ["--no_beta_gate"],
         "eval_flags":  ["--no_beta_gate"],
     },
     {
         "name": "feature_grid_7x7",
-        "description": "7×7 feature maps (L=49) instead of 14×14 (L=196) via adaptive avg pooling.",
+        "description": "Feature resolution ablation: adaptive avg pool to 7x7 feature grid (L=49).",
         "group": "architectural",
         "train_flags": ["--feature_grid_size", "7"],
         "eval_flags":  ["--feature_grid_size", "7"],
-    },
-    # ── Regularisation ───────────────────────────────────────────────────────
-    {
-        "name": "lambda_0",
-        "description": "λ=0: doubly stochastic attention regularisation fully disabled.",
-        "group": "regularisation",
-        "train_flags": ["--lambda_weight", "0.0"],
-        "eval_flags":  [],
-    },
-    {
-        "name": "lambda_0_5",
-        "description": "λ=0.5: softer doubly stochastic regularisation (half of paper default).",
-        "group": "regularisation",
-        "train_flags": ["--lambda_weight", "0.5"],
-        "eval_flags":  [],
-    },
-    {
-        "name": "lambda_2_0",
-        "description": "λ=2.0: stronger doubly stochastic regularisation (double paper default).",
-        "group": "regularisation",
-        "train_flags": ["--lambda_weight", "2.0"],
-        "eval_flags":  [],
-    },
-    # ── Encoder fine-tuning schedule ─────────────────────────────────────────
-    {
-        "name": "finetune_ep3",
-        "description": "Unlock encoder fine-tuning after epoch 3 (earlier than default 5).",
-        "group": "finetune_schedule",
-        "train_flags": ["--finetune_epoch", "3"],
-        "eval_flags":  [],
-    },
-    {
-        "name": "finetune_ep10",
-        "description": "Unlock encoder fine-tuning after epoch 10 (later than default 5).",
-        "group": "finetune_schedule",
-        "train_flags": ["--finetune_epoch", "10"],
-        "eval_flags":  [],
-    },
-    # ── Combined ─────────────────────────────────────────────────────────────
-    {
-        "name": "lambda_0_5_finetune3",
-        "description": "λ=0.5 combined with early encoder unlock at epoch 3.",
-        "group": "combined",
-        "train_flags": ["--lambda_weight", "0.5", "--finetune_epoch", "3"],
-        "eval_flags":  [],
     },
 ]
 
@@ -163,8 +120,8 @@ def ckpt_dir(name: str) -> Path:
 def best_ckpt(name: str) -> Path:
     return ckpt_dir(name) / "best.pt"
 
-def eval_out(name: str, sweep_tag: str) -> Path:
-    return exp_dir(name) / f"eval_{sweep_tag}.json"
+def eval_out(name: str, split: str) -> Path:
+    return exp_dir(name) / f"eval_{split}.json"
 
 
 # ---------------------------------------------------------------------------
@@ -181,15 +138,15 @@ def train_cmd(exp: dict) -> list:
         + ["--results_dir",    str(exp_dir(exp["name"]))]
     )
 
-def eval_cmd(exp: dict, sweep_tag: str, sweep_extra: list) -> list:
+def eval_cmd(exp: dict, split: str) -> list:
     return (
         [sys.executable, "evaluate.py"]
         + exp["eval_flags"]
-        + sweep_extra
         + ["--checkpoint",  str(best_ckpt(exp["name"]))]
         + ["--data_root",   DATA_ROOT]
         + ["--vocab",       VOCAB_PATH]
-        + ["--results_out", str(eval_out(exp["name"], sweep_tag))]
+        + ["--split",       split]
+        + ["--results_out", str(eval_out(exp["name"], split))]
         + ["--batch_size", "64"]
     )
 
@@ -207,7 +164,7 @@ def run(cmd: list, label: str) -> bool:
 
 
 def run_experiment(exp: dict, resume: bool) -> dict:
-    """Train one experiment then run the full eval sweep. Returns per-sweep scores."""
+    """Train one experiment then run val+test evaluation. Returns split->scores."""
     name = exp["name"]
 
     # ── Training ─────────────────────────────────────────────────────────────
@@ -223,22 +180,22 @@ def run_experiment(exp: dict, resume: bool) -> dict:
         print(f"[{name}] best.pt not found after training — skipping eval")
         return {}
 
-    # ── Eval sweep ───────────────────────────────────────────────────────────
-    sweep_scores = {}
-    for sweep_tag, sweep_extra in EVAL_SWEEP:
-        out_path = eval_out(name, sweep_tag)
+    # ── Eval (val + test) ────────────────────────────────────────────────────
+    split_scores = {}
+    for split in ("val", "test"):
+        out_path = eval_out(name, split)
         if resume and out_path.exists():
-            print(f"[{name}] {sweep_tag} already evaluated — skipping")
+            print(f"[{name}] {split} already evaluated — skipping")
             with open(out_path) as f:
-                sweep_scores[sweep_tag] = json.load(f)["scores"]
+                split_scores[split] = json.load(f)["scores"]
             continue
 
-        ok = run(eval_cmd(exp, sweep_tag, sweep_extra), f"EVAL   {name}  [{sweep_tag}]")
+        ok = run(eval_cmd(exp, split), f"EVAL   {name}  [{split}]")
         if ok and out_path.exists():
             with open(out_path) as f:
-                sweep_scores[sweep_tag] = json.load(f)["scores"]
+                split_scores[split] = json.load(f)["scores"]
 
-    return sweep_scores
+    return split_scores
 
 
 # ---------------------------------------------------------------------------
@@ -250,14 +207,14 @@ def load_all_results() -> dict:
     results = {}
     for exp in EXPERIMENTS:
         name = exp["name"]
-        sweep_scores = {}
-        for sweep_tag, _ in EVAL_SWEEP:
-            p = eval_out(name, sweep_tag)
+        split_scores = {}
+        for split in ("val", "test"):
+            p = eval_out(name, split)
             if p.exists():
                 with open(p) as f:
-                    sweep_scores[sweep_tag] = json.load(f)["scores"]
-        if sweep_scores:
-            results[name] = sweep_scores
+                    split_scores[split] = json.load(f)["scores"]
+        if split_scores:
+            results[name] = split_scores
     return results
 
 
@@ -269,20 +226,19 @@ def print_summary(results: dict) -> None:
     metrics = ["bleu1", "bleu2", "bleu3", "bleu4", "meteor"]
     mnames  = ["BLEU-1", "BLEU-2", "BLEU-3", "BLEU-4", "METEOR"]
 
-    # Pick the best sweep config (highest BLEU-4) for each experiment
-    def best_sweep(sweep_scores):
-        return max(sweep_scores.items(),
-                   key=lambda kv: kv[1].get("bleu4", 0))
+    def fmt_scores(scores: dict) -> str:
+        vals = [scores.get(k, 0) * 100 for k in ["bleu1", "bleu2", "bleu3", "bleu4"]]
+        vals.append(scores.get("meteor", 0) * 100)
+        return "  ".join(f"{v:>7.2f}" for v in vals)
 
     col_w = 28
     print("\n" + "=" * 90)
-    print("  ABLATION RESULTS SUMMARY  (best eval config per experiment)")
+    print("  ABLATION RESULTS SUMMARY")
     print("=" * 90)
-    print(f"  {'Experiment':<{col_w}}  {'Config':<16}  "
-          + "  ".join(f"{m:>7}" for m in mnames))
+    print(f"  {'Experiment':<{col_w}}  {'Split':<6}  " + "  ".join(f"{m:>7}" for m in mnames))
     print("  " + "-" * 86)
     # Paper baseline
-    print(f"  {'Paper Soft-Att (Table 1)':<{col_w}}  {'—':16}  "
+    print(f"  {'Paper Soft-Att (Table 1)':<{col_w}}  {'—':<6}  "
           + "  ".join(f"{PAPER[k]:>7.1f}" for k in metrics))
     print("  " + "-" * 86)
 
@@ -296,27 +252,23 @@ def print_summary(results: dict) -> None:
         print(f"\n  [{group}]")
         for name in names:
             if name not in results:
-                print(f"  {'  ' + name:<{col_w+2}}  {'(not run yet)':16}")
+                print(f"  {'  ' + name:<{col_w+2}}  {'(not run yet)':<6}")
                 continue
-            sweep_tag, scores = best_sweep(results[name])
-            meteor = scores.get("meteor", 0)
-            vals = [scores.get(k, 0)*100 for k in ["bleu1","bleu2","bleu3","bleu4"]]
-            vals.append(meteor*100)
-            row = "  ".join(f"{v:>7.2f}" for v in vals)
-            print(f"  {'  ' + name:<{col_w+2}}  {sweep_tag:<16}  {row}")
+            for split in ("val", "test"):
+                scores = results[name].get(split)
+                if not scores:
+                    continue
+                print(f"  {'  ' + name:<{col_w+2}}  {split:<6}  {fmt_scores(scores)}")
 
     print("\n" + "=" * 90)
-    print("  Full per-sweep breakdowns:")
-    for name, sweep_scores in results.items():
+    print("  Full per-split breakdowns:")
+    for name, split_scores in results.items():
         exp_obj = next(e for e in EXPERIMENTS if e["name"] == name)
         print(f"\n  {name}  [{exp_obj['group']}]")
-        print(f"    {'Sweep config':<20}  " + "  ".join(f"{m:>7}" for m in mnames))
-        print("    " + "-" * 68)
-        for sweep_tag, scores in sweep_scores.items():
-            vals = [scores.get(k, 0)*100 for k in ["bleu1","bleu2","bleu3","bleu4"]]
-            vals.append(scores.get("meteor", 0)*100)
-            row = "  ".join(f"{v:>7.2f}" for v in vals)
-            print(f"    {sweep_tag:<20}  {row}")
+        for split in ("val", "test"):
+            scores = split_scores.get(split)
+            if scores:
+                print(f"    {split:<6}  {fmt_scores(scores)}")
     print()
 
 
@@ -334,8 +286,8 @@ def print_plan(only: list) -> None:
         print(f"\n  [{name}]  group={exp['group']}")
         print(f"  {exp['description']}")
         print(f"\n  Train:  {' '.join(train_cmd(exp))}")
-        for sweep_tag, sweep_extra in EVAL_SWEEP:
-            print(f"  Eval [{sweep_tag}]:  {' '.join(eval_cmd(exp, sweep_tag, sweep_extra))}")
+        for split in ("val", "test"):
+            print(f"  Eval [{split}]:  {' '.join(eval_cmd(exp, split))}")
         print(f"\n  Outputs → {exp_dir(name)}/")
     print(f"\n{'─'*72}")
     print("Run with --run to execute, --resume to skip completed experiments.")

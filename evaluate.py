@@ -6,6 +6,7 @@ import os
 
 import nltk
 import torch
+import torch.nn as nn
 from nltk.translate.meteor_score import meteor_score as nltk_meteor
 from tqdm import tqdm
 
@@ -13,12 +14,15 @@ from config import (
     ATTENTION_DIM,
     ATTENTION_MODE,
     DECODER_DIM,
+    DROPOUT,
     EMBED_DIM,
     FEATURE_GRID_SIZE,
+    LAMBDA,
     MAX_DECODE_LEN,
     USE_BETA_GATE,
 )
 from models import Decoder, Encoder
+from train import doubly_stochastic_attention_loss
 from utils import (
     Vocabulary,
     beam_search_decode,
@@ -28,6 +32,7 @@ from utils import (
     print_bleu_table,
     tokenize_caption,
 )
+from utils.dataset import PAD_IDX
 
 
 def _warn_config_mismatch(ckpt: dict, args: argparse.Namespace) -> None:
@@ -37,6 +42,7 @@ def _warn_config_mismatch(ckpt: dict, args: argparse.Namespace) -> None:
         ("attention_mode", args.attention_mode),
         ("use_beta_gate", not args.no_beta_gate),
         ("feature_grid_size", args.feature_grid_size),
+        ("lambda_weight", args.lambda_weight),
     ]:
         ckpt_val = ckpt.get(key)
         if ckpt_val is not None and ckpt_val != cli_val:
@@ -61,8 +67,9 @@ def evaluate_test_set(
     attention_mode: str = ATTENTION_MODE,
     use_beta_gate: bool = USE_BETA_GATE,
     feature_grid_size: int = FEATURE_GRID_SIZE,
+    lambda_weight: float = LAMBDA,
 ):
-    """Load a checkpoint, generate captions, print BLEU-1..4 + METEOR, save JSON."""
+    """Load a checkpoint, compute loss, generate captions, print metrics, save JSON."""
     nltk.download("wordnet", quiet=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -82,7 +89,7 @@ def evaluate_test_set(
         embed_dim=EMBED_DIM,
         decoder_dim=DECODER_DIM,
         vocab_size=len(vocab),
-        dropout=0.0,
+        dropout=DROPOUT,
         attention_mode=attention_mode,
         use_beta_gate=use_beta_gate,
     ).to(device)
@@ -91,6 +98,8 @@ def evaluate_test_set(
     decoder.load_state_dict(ckpt["decoder"])
     encoder.eval()
     decoder.eval()
+
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
     dataloader = get_dataloader(
         data_root,
@@ -102,10 +111,33 @@ def evaluate_test_set(
 
     hypotheses = []
     references = []
+    loss_sum = 0.0
+    n_batches = 0
 
-    for images, _, _, all_caps in tqdm(dataloader, desc=f"Evaluating [{split}]"):
+    for images, captions, lengths, all_caps in tqdm(dataloader, desc=f"Evaluating [{split}]"):
+        # ------------------------------------------------------------------
+        # Loss (teacher forced)
+        # ------------------------------------------------------------------
+        images = images.to(device)
+        captions = captions.to(device)
+        lengths = lengths.to(device)
+
+        encoder_out = encoder(images)
+        predictions, alphas = decoder(encoder_out, captions, lengths)
+        targets = captions[:, 1:]
+        vocab_size = predictions.size(-1)
+        loss_ce = criterion(predictions.reshape(-1, vocab_size), targets.reshape(-1))
+        loss_ds = doubly_stochastic_attention_loss(alphas, weight=lambda_weight)
+        loss = loss_ce + loss_ds
+
+        loss_sum += float(loss.item())
+        n_batches += 1
+
+        # ------------------------------------------------------------------
+        # Decoding (greedy / beam)
+        # ------------------------------------------------------------------
         for i in range(images.size(0)):
-            image = images[i : i + 1].to(device)
+            image = images[i : i + 1]
             if beam_width == 1:
                 caption, _, _ = greedy_decode(
                     encoder, decoder, image, vocab, device, max_len=MAX_DECODE_LEN
@@ -131,6 +163,7 @@ def evaluate_test_set(
         nltk_meteor(refs, hyp) for hyp, refs in zip(hypotheses, references)
     ) / max(len(hypotheses), 1)
     scores["meteor"] = meteor
+    scores["loss"] = loss_sum / max(n_batches, 1)
 
     model_label = (
         f"attention={attention_mode}, beta={use_beta_gate}, "
@@ -138,6 +171,7 @@ def evaluate_test_set(
     )
     print_bleu_table(model_label, scores, dataset=split.capitalize())
     print(f"  METEOR (sentence-level avg): {meteor * 100:.2f}")
+    print(f"  {split} loss: {scores['loss']:.4f}")
 
     if results_out:
         os.makedirs(os.path.dirname(results_out) or ".", exist_ok=True)
@@ -151,6 +185,7 @@ def evaluate_test_set(
                     "attention_mode": attention_mode,
                     "use_beta_gate": use_beta_gate,
                     "feature_grid_size": feature_grid_size,
+                    "lambda_weight": lambda_weight,
                     "scores": scores,
                 },
                 f,
@@ -176,7 +211,7 @@ if __name__ == "__main__":
     # --- Ablation flags (must match the flags used during training) ---
     parser.add_argument(
         "--attention_mode",
-        choices=["soft", "none"],
+        choices=["soft", "uniform", "none"],
         default=ATTENTION_MODE,
         help="Must match the mode used when training the checkpoint.",
     )
@@ -192,6 +227,15 @@ if __name__ == "__main__":
         choices=[7, 14],
         default=FEATURE_GRID_SIZE,
         help="Feature grid size (must match training setting).",
+    )
+    parser.add_argument(
+        "--lambda_weight",
+        type=float,
+        default=LAMBDA,
+        help=(
+            f"Doubly stochastic regularization weight used at training time (default: {LAMBDA}). "
+            "Used here only to report loss; BLEU/METEOR are unaffected."
+        ),
     )
     args = parser.parse_args()
 
@@ -211,4 +255,5 @@ if __name__ == "__main__":
         attention_mode=args.attention_mode,
         use_beta_gate=not args.no_beta_gate,
         feature_grid_size=args.feature_grid_size,
+        lambda_weight=args.lambda_weight,
     )
