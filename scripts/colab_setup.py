@@ -17,6 +17,8 @@ import random as _random
 import shutil
 import subprocess
 import sys
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -38,6 +40,13 @@ SPLIT_FILES = [
 # Val and test are fixed at 1000 each; training gets ALL remaining images.
 N_VAL  = 1000
 N_TEST = 1000
+
+MIN_IMAGE_FILES = 100
+EXPECTED_SPLIT_COUNTS = {
+    "Flickr_8k.trainImages.txt": 6000,
+    "Flickr_8k.devImages.txt": 1000,
+    "Flickr_8k.testImages.txt": 1000,
+}
 
 # Public mirror used by the one-click Colab notebook as a fallback when the user
 # hasn't uploaded the dataset into Drive.
@@ -64,9 +73,27 @@ def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
-def copy_or_link(src: Path, dst: Path, use_symlink: bool):
+def count_jpegs(path: Path) -> int:
+    return len(list(path.glob("*.jpg"))) + len(list(path.glob("*.jpeg")))
+
+
+def remove_path(path: Path):
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def copy_or_link(src: Path, dst: Path, use_symlink: bool, overwrite: bool = False):
     if dst.exists() or dst.is_symlink():
-        return
+        try:
+            if src.resolve() == dst.resolve():
+                return
+        except FileNotFoundError:
+            pass
+        if not overwrite:
+            return
+        remove_path(dst)
     ensure_dir(dst.parent)
     if use_symlink:
         os.symlink(src.resolve(), dst)
@@ -152,6 +179,7 @@ def normalize_flickr8k(
     data_root: Path,
     use_symlink: bool = True,
     require_official_splits: bool = False,
+    overwrite_existing: bool = False,
 ):
     """Normalize common Kaggle/official Flickr8k layouts into data/flickr8k.
 
@@ -189,7 +217,7 @@ def normalize_flickr8k(
             "flicker8k_dataset",
             "flickr8k_dataset",
         }:
-            jpg_count = len(list(candidate.glob("*.jpg"))) + len(list(candidate.glob("*.jpeg")))
+            jpg_count = count_jpegs(candidate)
             if jpg_count > 100:
                 image_dir = candidate
                 break
@@ -200,7 +228,12 @@ def normalize_flickr8k(
             "Expected a folder named 'images' (or similar) containing .jpg files."
         )
 
-    copy_or_link(image_dir, data_root / "images", use_symlink=use_symlink)
+    copy_or_link(
+        image_dir,
+        data_root / "images",
+        use_symlink=use_symlink,
+        overwrite=overwrite_existing,
+    )
 
     # ------------------------------------------------------------------
     # 2. Captions — required; accept captions.txt or Flickr8k.token.txt.
@@ -218,15 +251,28 @@ def normalize_flickr8k(
         raise FileNotFoundError(
             f"Could not find captions.txt or Flickr8k.token.txt under {source_dir}."
         )
-    copy_or_link(captions_src, data_root / "captions.txt", use_symlink=use_symlink)
+    copy_or_link(
+        captions_src,
+        data_root / "captions.txt",
+        use_symlink=use_symlink,
+        overwrite=overwrite_existing,
+    )
 
     # ------------------------------------------------------------------
     # 3. Split files — link if present, otherwise auto-generate
     # ------------------------------------------------------------------
     for filename in SPLIT_FILES:
         src = find_first(source_dir, [filename])
+        dst = data_root / filename
         if src is not None:
-            copy_or_link(src, data_root / filename, use_symlink=use_symlink)
+            copy_or_link(
+                src,
+                dst,
+                use_symlink=use_symlink,
+                overwrite=overwrite_existing,
+            )
+        elif overwrite_existing:
+            remove_path(dst)
 
     missing_splits = [f for f in SPLIT_FILES if not (data_root / f).exists()]
     splits_generated = False
@@ -276,12 +322,34 @@ def download_public_flickr8k(download_dir: Path) -> None:
     for filename, url in PUBLIC_FLICKR8K_URLS.items():
         out = download_dir / filename
         if out.exists():
-            print(f"{filename} already exists — skipping download")
-            continue
+            if zipfile.is_zipfile(out):
+                print(f"{filename} already exists — skipping download")
+                continue
+            print(f"{filename} exists but is not a valid zip — downloading again")
+            out.unlink()
 
-        print(f"Downloading {filename} …")
-        with urllib.request.urlopen(url) as r, open(out, "wb") as f:
-            shutil.copyfileobj(r, f)
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 colab-setup"},
+        )
+        tmp = out.with_suffix(out.suffix + ".part")
+        remove_path(tmp)
+        for attempt in range(1, 4):
+            try:
+                print(f"Downloading {filename} (attempt {attempt}/3) …")
+                with urllib.request.urlopen(request, timeout=120) as r, open(tmp, "wb") as f:
+                    shutil.copyfileobj(r, f)
+                tmp.replace(out)
+                break
+            except (OSError, TimeoutError, urllib.error.URLError) as exc:
+                remove_path(tmp)
+                if attempt == 3:
+                    raise RuntimeError(f"Failed to download {filename} from {url}") from exc
+                time.sleep(2 * attempt)
+
+        if not zipfile.is_zipfile(out):
+            remove_path(out)
+            raise zipfile.BadZipFile(f"Downloaded file is not a zip archive: {out}")
 
     for zip_path in download_dir.glob("*.zip"):
         print(f"Unzipping {zip_path}")
@@ -289,10 +357,69 @@ def download_public_flickr8k(download_dir: Path) -> None:
             zf.extractall(download_dir)
 
 
-def validate(data_root: Path, strict: bool = True):
-    from utils import validate_dataset_layout
+def _normalize_image_name(image_id: str) -> str:
+    return os.path.basename(image_id.strip().split("#")[0])
 
-    validate_dataset_layout(str(data_root), strict_split_counts=strict)
+
+def _resolve_images_dir(data_root: Path) -> Path:
+    for name in ("images", "Images"):
+        path = data_root / name
+        if path.is_dir():
+            return path
+    return data_root / "images"
+
+
+def validate(data_root: Path, strict: bool = True):
+    """Validate data layout without importing torch-dependent project modules."""
+    images_dir = _resolve_images_dir(data_root)
+    expected = [
+        images_dir,
+        data_root / "captions.txt",
+        *[data_root / name for name in SPLIT_FILES],
+    ]
+    missing = [path for path in expected if not path.exists()]
+    if missing:
+        missing_text = "\n  ".join(str(path) for path in missing)
+        raise FileNotFoundError(f"Flickr8k files are missing:\n  {missing_text}")
+
+    image_count = count_jpegs(images_dir)
+    if image_count <= MIN_IMAGE_FILES:
+        raise ValueError(
+            f"Expected Flickr8k images under {images_dir}, but found only {image_count} JPEG files."
+        )
+
+    if strict:
+        split_sets = {}
+        for filename, expected_count in EXPECTED_SPLIT_COUNTS.items():
+            split_path = data_root / filename
+            names = {
+                _normalize_image_name(line)
+                for line in split_path.read_text().splitlines()
+                if line.strip()
+            }
+            if len(names) != expected_count:
+                raise ValueError(
+                    f"{filename} contains {len(names)} unique images; expected {expected_count}."
+                )
+            split_sets[filename] = names
+
+        all_images = set().union(*split_sets.values())
+        if len(all_images) != sum(EXPECTED_SPLIT_COUNTS.values()):
+            raise ValueError(
+                "Train/val/test split files overlap or are incomplete; expected "
+                "8000 unique image names across the standard Flickr8k splits."
+            )
+
+        missing_images = sorted(
+            name for name in all_images if not (images_dir / name).exists()
+        )
+        if missing_images:
+            preview = ", ".join(missing_images[:5])
+            raise FileNotFoundError(
+                f"{len(missing_images)} split images are missing from {images_dir} "
+                f"(first few: {preview})."
+            )
+
     print("Dataset validation passed.")
 
 
@@ -340,20 +467,25 @@ def main():
         download_dir = Path(args.public_download_dir)
         download_public_flickr8k(download_dir)
         source_dir = download_dir
+        overwrite_existing = True
     elif args.download_kaggle:
         download_dir = Path(args.kaggle_download_dir)
         download_from_kaggle(args.kaggle_dataset, download_dir)
         source_dir = download_dir
+        overwrite_existing = True
     elif args.source_dir:
         source_dir = Path(args.source_dir)
+        overwrite_existing = False
     else:
         source_dir = data_root
+        overwrite_existing = False
 
     splits_generated = normalize_flickr8k(
         source_dir,
         data_root,
         use_symlink=not args.copy,
         require_official_splits=args.require_official_splits,
+        overwrite_existing=overwrite_existing,
     )
     # Skip strict count check when we auto-generated splits (split differs from official 6000/1000/1000).
     strict = not args.no_strict
