@@ -2,14 +2,12 @@
 Pre-extract VGG-16 features for all COCO images used by VQA yes/no training.
 
 Saves sharded feature files to avoid OOM during extraction and merging:
-    data/vqa/features_train2014/chunk_0000.pt
-    data/vqa/features_train2014/chunk_0001.pt
-    ...
-    data/vqa/features_val2014/chunk_0000.pt
-    ...
+    data/vqa/features_train2014/chunk_0000.pt  ...
+    data/vqa/features_val2014/chunk_0000.pt    ...
 
-Each shard is a dict[int, Tensor(196, 512)].  VQAYesNoDataset reads shards
-lazily so no single load ever exceeds ~800 MB.
+Each shard is backed up to Drive immediately after it is written, so a crash
+at any point loses at most one in-progress shard.  Re-running resumes from
+the last completed shard (local or Drive).
 """
 
 import os
@@ -30,7 +28,8 @@ DATA_ROOT   = "data/vqa"
 IMAGES_DIR  = os.path.join(DATA_ROOT, "images")
 DRIVE_CACHE = Path("/content/drive/MyDrive/vqa_results/data/vqa")
 
-CHUNK_SIZE = 2000  # images per shard (~800 MB each at float32)
+CHUNK_SIZE = 2000  # images per shard
+
 
 _TRANSFORM = transforms.Compose([
     transforms.Resize(256),
@@ -59,53 +58,97 @@ class _ImageDataset(Dataset):
         return image_id, _TRANSFORM(img)
 
 
+def _restore_from_drive(shard_dir: Path, drive_dir: Path):
+    """Copy any shards that are on Drive but not yet local."""
+    if not drive_dir.exists():
+        return
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    for src in sorted(drive_dir.glob("chunk_*.pt")):
+        dst = shard_dir / src.name
+        if not dst.exists():
+            print(f"[extract] Restoring {src.name} from Drive ...")
+            shutil.copy2(src, dst)
+
+
+def _backup_shard(shard_path: Path, drive_dir: Path):
+    """Copy one shard to Drive immediately after writing."""
+    drive_dir.mkdir(parents=True, exist_ok=True)
+    dest = drive_dir / shard_path.name
+    shutil.copy2(shard_path, dest)
+
+
+def _already_done(shard_dir: Path, drive_dir: Path, n_images: int) -> bool:
+    """True if enough shards exist (locally or on Drive) to cover all images."""
+    expected_shards = (n_images + CHUNK_SIZE - 1) // CHUNK_SIZE
+    local  = len(list(shard_dir.glob("chunk_*.pt"))) if shard_dir.exists() else 0
+    remote = len(list(drive_dir.glob("chunk_*.pt"))) if drive_dir.exists() else 0
+    return max(local, remote) >= expected_shards
+
+
 def extract_split(split: str, device: torch.device, encoder: Encoder, batch_size: int = 64):
     shard_dir = Path(DATA_ROOT) / f"features_{split}2014"
-    if shard_dir.exists() and any(shard_dir.glob("chunk_*.pt")):
-        print(f"[extract] {shard_dir} already has shards — skipping.")
-        return
+    drive_dir = DRIVE_CACHE / shard_dir.name
 
     img_dir   = Path(IMAGES_DIR) / f"{split}2014"
     image_ids = sorted(int(p.stem.split("_")[-1]) for p in img_dir.glob("*.jpg"))
-    print(f"[extract] {split}: {len(image_ids):,} images")
+    n_images  = len(image_ids)
+    print(f"[extract] {split}: {n_images:,} images")
 
+    if _already_done(shard_dir, drive_dir, n_images):
+        # Ensure all Drive shards are local before declaring done
+        _restore_from_drive(shard_dir, drive_dir)
+        print(f"[extract] {split}: all shards present — skipping.")
+        return
+
+    # Restore whatever Drive has so we can resume
+    _restore_from_drive(shard_dir, drive_dir)
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    ds     = _ImageDataset(image_ids, split)
+    # Find already-completed shards to skip their image IDs
+    done_shards = sorted(shard_dir.glob("chunk_*.pt"))
+    done_ids: set = set()
+    for s in done_shards:
+        data = torch.load(s, map_location="cpu", weights_only=True)
+        done_ids.update(data.keys())
+    if done_ids:
+        print(f"[extract] Resuming — {len(done_ids):,} images already done, "
+              f"{n_images - len(done_ids):,} remaining")
+
+    remaining_ids = [iid for iid in image_ids if iid not in done_ids]
+    if not remaining_ids:
+        print(f"[extract] {split}: nothing left to extract.")
+        return
+
+    chunk_idx = len(done_shards)
+    ds     = _ImageDataset(remaining_ids, split)
     loader = DataLoader(ds, batch_size=batch_size, num_workers=2,
                         pin_memory=True, persistent_workers=False)
 
     chunk: dict = {}
-    chunk_idx   = 0
-
     encoder.eval()
     with torch.no_grad():
         for ids, imgs in tqdm(loader, desc=f"Extracting {split}"):
-            feats = encoder(imgs.to(device)).cpu()   # (B, 196, 512) float32
+            feats = encoder(imgs.to(device)).cpu()
             for iid, feat in zip(ids.tolist(), feats):
                 chunk[iid] = feat
             if len(chunk) >= CHUNK_SIZE:
-                _save_shard(shard_dir, chunk_idx, chunk, split)
+                shard_path = _write_shard(shard_dir, chunk_idx, chunk)
+                _backup_shard(shard_path, drive_dir)
                 chunk_idx += 1
                 chunk = {}
 
     if chunk:
-        _save_shard(shard_dir, chunk_idx, chunk, split)
+        shard_path = _write_shard(shard_dir, chunk_idx, chunk)
+        _backup_shard(shard_path, drive_dir)
 
-    # Back up shards to Drive
-    drive_dir = DRIVE_CACHE / shard_dir.name
-    drive_dir.mkdir(parents=True, exist_ok=True)
-    for shard in sorted(shard_dir.glob("chunk_*.pt")):
-        dest = drive_dir / shard.name
-        if not dest.exists():
-            shutil.copy2(shard, dest)
-    print(f"[extract] Backed up shards → {drive_dir}")
+    print(f"[extract] {split}: done.")
 
 
-def _save_shard(shard_dir: Path, idx: int, chunk: dict, split: str):
+def _write_shard(shard_dir: Path, idx: int, chunk: dict) -> Path:
     path = shard_dir / f"chunk_{idx:04d}.pt"
     torch.save(chunk, path)
     print(f"[extract] Shard {idx:04d}: {len(chunk):,} features → {path}")
+    return path
 
 
 def main():
