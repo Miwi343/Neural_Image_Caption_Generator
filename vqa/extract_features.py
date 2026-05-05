@@ -53,6 +53,9 @@ class _ImageDataset(Dataset):
         return image_id, _TRANSFORM(img)
 
 
+_CHUNK_SIZE = 2000  # flush to disk every N images (~800 MB per chunk)
+
+
 def extract_split(split: str, device: torch.device, encoder: Encoder, batch_size: int = 64):
     out_path = Path(DATA_ROOT) / f"features_{split}2014.pt"
     if out_path.exists():
@@ -66,19 +69,45 @@ def extract_split(split: str, device: torch.device, encoder: Encoder, batch_size
     )
     print(f"[extract] {split}: {len(image_ids):,} images")
 
+    # Write features in chunks to avoid accumulating 8+ GB in RAM.
+    # Each chunk is saved as a separate .pt shard, then merged at the end.
+    chunk_dir = Path(DATA_ROOT) / f"_chunks_{split}2014"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
     ds     = _ImageDataset(image_ids, split)
     loader = DataLoader(ds, batch_size=batch_size, num_workers=2,
                         pin_memory=True, persistent_workers=False)
 
-    features = {}
+    chunk: dict = {}
+    chunk_idx   = 0
+    total_saved = 0
+
     encoder.eval()
     with torch.no_grad():
         for ids, imgs in tqdm(loader, desc=f"Extracting {split}"):
-            imgs = imgs.to(device)
-            feats = encoder(imgs)          # (B, 196, 512)
-            feats = feats.cpu()
+            imgs  = imgs.to(device)
+            feats = encoder(imgs).cpu()   # (B, 196, 512) float32
             for iid, feat in zip(ids.tolist(), feats):
-                features[iid] = feat       # (196, 512) float32
+                chunk[iid] = feat
+            if len(chunk) >= _CHUNK_SIZE:
+                shard = chunk_dir / f"chunk_{chunk_idx:04d}.pt"
+                torch.save(chunk, shard)
+                total_saved += len(chunk)
+                chunk_idx   += 1
+                chunk        = {}
+
+    if chunk:
+        shard = chunk_dir / f"chunk_{chunk_idx:04d}.pt"
+        torch.save(chunk, shard)
+        total_saved += len(chunk)
+
+    # Merge all shards into a single file
+    print(f"[extract] Merging {chunk_idx + 1} shards …")
+    features = {}
+    for shard in sorted(chunk_dir.glob("chunk_*.pt")):
+        features.update(torch.load(shard, weights_only=True))
+        shard.unlink()
+    chunk_dir.rmdir()
 
     torch.save(features, out_path)
     print(f"[extract] Saved {len(features):,} features → {out_path}")
