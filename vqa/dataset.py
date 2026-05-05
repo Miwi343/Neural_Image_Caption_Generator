@@ -125,20 +125,9 @@ class VQAYesNoDataset(Dataset):
         q_path   = os.path.join(data_root, f"v2_OpenEnded_mscoco_{coco_split}2014_questions.json")
         all_pairs = _load_yes_no_pairs(ann_path, q_path)
 
-        def _valid(path):
-            if not os.path.exists(path):
-                return False
-            try:
-                with Image.open(path) as img:
-                    img.verify()
-                return True
-            except Exception:
-                return False
-
-        self.pairs = [p for p in all_pairs if _valid(_coco_image_path(self.images_dir, coco_split, p[0]))]
+        self.pairs = [p for p in all_pairs if os.path.exists(_coco_image_path(self.images_dir, coco_split, p[0]))]
         kept, total = len(self.pairs), len(all_pairs)
-        if kept < total:
-            print(f"[VQAYesNoDataset/{split}] {kept:,} / {total:,} pairs kept ({total-kept:,} missing images skipped)")
+        print(f"[VQAYesNoDataset/{split}] {kept:,} / {total:,} pairs kept ({total-kept:,} missing images skipped)")
 
         if max_samples is not None:
             self.pairs = self.pairs[:max_samples]
