@@ -1,14 +1,23 @@
-"""Compatibility wrapper for the requested code/ layout."""
+"""Project hyperparameters for the Flickr8k soft-attention reproduction."""
 
-import importlib.util
-import os
+EMBED_DIM = 512
+DECODER_DIM = 512
+ATTENTION_DIM = 512
+ENCODER_DIM = 512
+DROPOUT = 0.5
+VOCAB_SIZE = 10_000
 
-ROOT = os.path.dirname(os.path.dirname(__file__))
-spec = importlib.util.spec_from_file_location("_sat_config", os.path.join(ROOT, "config.py"))
-module = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(module)
+LAMBDA = 1.0
+GRAD_CLIP = 5.0
+LEARNING_RATE = 4e-4
+ENCODER_LR = 1e-4
+ENCODER_FINETUNE_EPOCH = 5
+BATCH_SIZE = 64
+NUM_EPOCHS = 50
+PATIENCE = 10
+MAX_DECODE_LEN = 50
 
-for name in dir(module):
-    if name.isupper():
-        globals()[name] = getattr(module, name)
+DATA_ROOT = "data/flickr8k"
+VOCAB_PATH = "data/flickr8k/vocab.json"
+CHECKPOINT_DIR = "checkpoints"
+RESULTS_DIR = "results"

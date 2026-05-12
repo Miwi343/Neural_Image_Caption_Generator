@@ -7,22 +7,34 @@ The implementation uses a frozen ImageNet VGG-19/OxfordNet encoder, additive sof
 ## Repository Layout
 
 ```text
-models/
-  encoder.py       VGG-19 feature extractor
-  attention.py     soft additive attention
-  decoder.py       LSTM decoder and deep output layer
-model.py           end-to-end encoder/decoder wrapper
-code/              compatibility wrappers matching the course layout
-utils/
-  dataset.py       Flickr8k loading, tokenization, vocabulary, buckets
-  metrics.py       BLEU-1..4 without brevity penalty
-train.py           training, validation BLEU-4 early stopping
-evaluate.py        test-set BLEU table
-visualize.py       word-level attention overlays
-config.py          hyperparameters and paths
-data/              dataset instructions
-results/           BLEU logs and attention figures
+README.md
+code/
+  config.py
+  model.py
+  train.py
+  evaluate.py
+  visualize.py
+  models/
+    encoder.py
+    attention.py
+    decoder.py
+  utils/
+    dataset.py
+    metrics.py
+    decoding.py
+  scripts/
+    colab_setup.py
+data/
+results/
+poster/
+  DL Project Poster.pdf
+report/
+LICENSE
+.gitignore
 ```
+
+The thin root-level Python files are compatibility launchers/imports, so both
+`python code/train.py` and `python train.py` continue to work.
 
 ## Setup
 
@@ -58,7 +70,7 @@ The loader validates the standard split sizes: train `6000`, validation `1000`, 
 ## Train
 
 ```bash
-python train.py
+python code/train.py
 ```
 
 Outputs:
@@ -80,7 +92,7 @@ with `lambda=1.0` by default.
 ## Evaluate
 
 ```bash
-python evaluate.py \
+python code/evaluate.py \
   --checkpoint checkpoints/best.pt \
   --split test \
   --results_out results/test_bleu.json
@@ -99,7 +111,7 @@ BLEU is computed from corpus clipped n-gram precision without brevity penalty, m
 Generate six qualitative examples from the test split:
 
 ```bash
-python visualize.py \
+python code/visualize.py \
   --checkpoint checkpoints/best.pt \
   --vocab data/flickr8k/vocab.json \
   --data_root data/flickr8k \
@@ -111,7 +123,7 @@ python visualize.py \
 Or pass explicit images:
 
 ```bash
-python visualize.py --images data/flickr8k/images/123456.jpg
+python code/visualize.py --images data/flickr8k/images/123456.jpg
 ```
 
 Each generated word gets a `14x14` attention map upsampled to `224x224`, Gaussian-smoothed, and overlaid on the input image.
