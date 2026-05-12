@@ -1,0 +1,11 @@
+Generative AI Disclosure
+
+We used a large language model as an assistance tool during this project.
+The LLM helped us replicate the paper by supporting implementation planning,
+breaking down functions, understanding documentation, and reasoning through
+some of the more complex mathematical components.
+
+The LLM was also used to help plan and implement new features, including
+suggesting code organization, clarifying function responsibilities, and helping
+translate mathematical ideas into code. All final code, experiments, results,
+and project decisions were reviewed and validated by the project team.
