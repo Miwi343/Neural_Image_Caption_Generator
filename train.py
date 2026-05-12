@@ -49,6 +49,8 @@ from config import (
     DECODER_DIM,
     DROPOUT,
     EMBED_DIM,
+    ENCODER_FINETUNE_EPOCH,
+    ENCODER_LR,
     GRAD_CLIP,
     LAMBDA,
     MAX_DECODE_LEN,
@@ -83,7 +85,8 @@ def doubly_stochastic_attention_loss(alphas: torch.Tensor, weight: float = LAMBD
     return weight * ((1.0 - alphas.sum(dim=1)) ** 2).sum(dim=1).mean()
 
 
-def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoch):
+def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoch,
+                fine_tune_encoder=False):
     """
     Run one training epoch.
 
@@ -100,14 +103,11 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
 
     Returns:
         avg_loss: float
-
-    Future work (Issue #7, deferred): If extra training diagnostics are useful, compute
-    top-5 next-word accuracy from `predictions` vs `targets` and report it
-    alongside loss without affecting optimisation.
-    Future work (Issue #9, deferred): If TensorBoard/W&B logging is enabled, emit
-    per-step and per-epoch loss here using stable metric names.
     """
-    encoder.eval()   # encoder stays frozen — no batch norm updates needed
+    if fine_tune_encoder:
+        encoder.train()
+    else:
+        encoder.eval()
     decoder.train()
 
     total_loss = 0.0
@@ -119,9 +119,13 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
         captions = captions.to(device)
         lengths  = lengths.to(device)
 
-        # Encode: (batch, 196, 512)
-        with torch.no_grad():
+        # Encode: (batch, 196, 512).  Skip no_grad when fine-tuning so
+        # gradients flow through the unfrozen encoder layers.
+        if fine_tune_encoder:
             encoder_out = encoder(images)
+        else:
+            with torch.no_grad():
+                encoder_out = encoder(images)
 
         # Decode: predictions (batch, max_len-1, vocab_size)
         #         alphas      (batch, max_len-1, 196)
@@ -243,9 +247,11 @@ def main():
         print(f"Vocabulary size: {len(vocab)}")
 
     # Dataloaders
-    train_loader = get_dataloader(DATA_ROOT, vocab, "train", BATCH_SIZE)
+    num_workers = min(4, os.cpu_count() or 1)
+    train_loader = get_dataloader(DATA_ROOT, vocab, "train", BATCH_SIZE,
+                                  num_workers=num_workers)
     val_loader   = get_dataloader(DATA_ROOT, vocab, "val",   BATCH_SIZE,
-                                  use_bucket_sampler=False)
+                                  num_workers=num_workers, use_bucket_sampler=False)
 
     # Models
     encoder = Encoder(fine_tune=False).to(device)
@@ -260,20 +266,38 @@ def main():
     # RMSProp — paper §4.3: "For Flickr8k we found RMSProp worked best."
     optimizer = RMSprop(decoder.parameters(), lr=LEARNING_RATE)
 
+    # Reduce LR by half when BLEU-4 stops improving for 3 epochs.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=3
+    )
+
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_IDX)
 
     best_bleu4 = 0.0
     best_scores = None
     epochs_no_improve = 0
+    fine_tune_encoder = False
     log_path = os.path.join(RESULTS_DIR, "training_log.csv")
     with open(log_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "val_bleu1", "val_bleu2", "val_bleu3", "val_bleu4", "seconds"])
 
     for epoch in range(1, NUM_EPOCHS + 1):
+
+        # Enable encoder fine-tuning after warmup and add its params to optimizer.
+        if epoch == ENCODER_FINETUNE_EPOCH + 1 and not fine_tune_encoder:
+            encoder._enable_fine_tune()
+            optimizer.add_param_group({
+                "params": [p for p in encoder.parameters() if p.requires_grad],
+                "lr": ENCODER_LR,
+            })
+            fine_tune_encoder = True
+            print(f"Epoch {epoch}: encoder fine-tuning enabled (LR={ENCODER_LR})")
+
         t0 = time.time()
         train_loss = train_epoch(
-            encoder, decoder, train_loader, optimizer, criterion, device, epoch
+            encoder, decoder, train_loader, optimizer, criterion, device, epoch,
+            fine_tune_encoder=fine_tune_encoder,
         )
         val_scores = validate(encoder, decoder, val_loader, vocab, device)
         val_bleu4 = val_scores["bleu4"]
@@ -338,4 +362,15 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Train Show, Attend and Tell")
+    parser.add_argument("--lambda_weight", type=float, default=LAMBDA,
+                        help=f"Doubly stochastic attention regularisation weight (default: {LAMBDA})")
+    parser.add_argument("--finetune_epoch", type=int, default=ENCODER_FINETUNE_EPOCH,
+                        help=f"Epoch to start encoder fine-tuning (default: {ENCODER_FINETUNE_EPOCH})")
+    args = parser.parse_args()
+
+    LAMBDA = args.lambda_weight
+    ENCODER_FINETUNE_EPOCH = args.finetune_epoch
+
     main()

@@ -83,7 +83,7 @@ def test_decoder_forward_masks_inactive_attention_and_uses_scalar_beta():
     assert c.max() <= 1.0 and c.min() >= -1.0
 
 
-def test_doubly_stochastic_loss_sums_regions_then_averages_batch():
+def test_doubly_stochastic_loss_averages_over_batch_and_locations():
     alphas = torch.zeros(2, 3, 4)
     alphas[:, :, 0] = 1.0 / 3.0
 
