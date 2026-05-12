@@ -1,0 +1,18 @@
+{
+  "checkpoint": "checkpoints/best.pt",
+  "split": "val",
+  "beam_width": 1,
+  "length_normalize": false,
+  "attention_mode": "soft",
+  "use_beta_gate": true,
+  "feature_grid_size": 14,
+  "lambda_weight": 1.0,
+  "scores": {
+    "bleu1": 0.623229461756374,
+    "bleu2": 0.432795789623203,
+    "bleu3": 0.28994335559094536,
+    "bleu4": 0.19198411475312813,
+    "meteor": 0.39083505769364674,
+    "loss": 3.807353377342224
+  }
+}

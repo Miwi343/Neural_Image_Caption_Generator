@@ -1,0 +1,9 @@
+{
+  "attention_mode": "soft",
+  "use_beta_gate": true,
+  "lambda_weight": 1.0,
+  "feature_grid_size": 14,
+  "finetune_epoch": 5,
+  "checkpoint_dir": "checkpoints",
+  "results_dir": "results"
+}
