@@ -1,0 +1,13 @@
+{
+  "checkpoint": "checkpoints/best.pt",
+  "split": "test",
+  "beam_width": 1,
+  "length_normalize": false,
+  "scores": {
+    "bleu1": 0.6095472440944882,
+    "bleu2": 0.4294895112146992,
+    "bleu3": 0.2912583439439108,
+    "bleu4": 0.19534785148761694,
+    "meteor": 0.4015774658598656
+  }
+}
