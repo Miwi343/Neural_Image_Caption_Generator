@@ -1,4 +1,4 @@
-"""Compatibility wrapper for the requested code/ layout."""
+"""Compatibility wrapper for code/ imports."""
 
 import os
 import sys
