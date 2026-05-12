@@ -17,8 +17,9 @@ We target **Table 1** of Xu et al. (2015): BLEU scores for soft (deterministic) 
 | Model | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 |
 |---|---|---|---|---|
 | Paper target (soft attention) | 67.0 | 44.8 | 29.9 | 19.5 |
-| **Ours (soft attention, VGG-19)** | — | — | — | — |
-| **Ours (adaptive, λ=0.01)** | 62.2 | 43.4 | 29.4 | **19.8** |
+| **Ours (soft attention, VGG-19)** | 60.64 | 41.93 | 27.89 | 18.36 |
+| **Ours (soft attention, optimized)** | **66.97** | **48.62** | **34.06** | **23.48** |
+| **Ours (adaptive, λ=0.01)** | 62.2 | 43.4 | 29.4 | 19.8 |
 | **Ours (adaptive, λ=1.0)** | 62.4 | 43.6 | 29.1 | 18.8 |
 
 BLEU-4 is the primary reproduction target; our adaptive variant (λ=0.01) matches and slightly exceeds the paper's reported 19.5.
@@ -55,16 +56,16 @@ report/             PDF of final project report
 - **Dataset:** Flickr8k — 6 000 train / 1 000 val / 1 000 test; vocabulary capped at 10 000 tokens
 
 **Extension 1 — Adaptive Attention (`adaptive-attention` branch):**
-- Implements Lu et al. (CVPR 2017): a *visual sentinel* `s_t = i_t ⊙ tanh(c_t)` gives the decoder a fallback vector to attend to when visual context is uninformative (e.g. function words). Requires a custom `AdaptiveLSTMCell` to expose the input gate explicitly. Tested under two regularization weights: λ=0.01 and λ=1.0.
+- Implements Lu et al. (CVPR 2017): a *visual sentinel* `s_t = i_t ⊙ tanh(c_t)` gives the decoder a fallback vector to attend to when visual context is uninformative (e.g. function words). Tested under two regularization weights: λ=0.01 and λ=1.0.
 
 **Extension 2 — VQA transfer (`experiment/visualQA` branch):**
-- Reuses the unchanged VGG-19 encoder and soft attention to answer binary yes/no questions from VQA v2 (~38 % of the dataset). A GRU question encoder replaces `h_{t-1}` in the attention energy; a small MLP classifies `[ẑ ‖ q]`. Features are pre-extracted once (~30–60 min) and cached, making subsequent epochs ~10× faster. Includes a PCA visualization that maps 512-d encoder features to RGB to reveal spatial structure.
+- Reuses the unchanged VGG-19 encoder and soft attention to answer binary yes/no questions from VQA v2 (~38 % of the dataset). A GRU question encoder replaces `h_{t-1}` in the attention energy; a small MLP classifies `[ẑ ‖ q]`.
 
 ---
 
 ## 5. Reproduction Steps
 
-**Requirements:** Python ≥ 3.9, PyTorch ≥ 2.0, a CUDA GPU (T4 or better recommended; ~4–8 h on Colab)
+**Requirements:** Python ≥ 3.9, PyTorch ≥ 2.0, a CUDA GPU (T4 or better recommended; around 4–8 h on Colab)
 
 ### Local
 
@@ -79,7 +80,7 @@ Download Flickr8k from Kaggle and place files at:
 
 ```
 data/flickr8k/
-  images/                         # ~8 000 JPEG images
+  images/                         # around 8 000 JPEG images
   captions.txt
   Flickr_8k.trainImages.txt
   Flickr_8k.devImages.txt
@@ -114,14 +115,13 @@ pytest -q
 | Config | BLEU-1 | BLEU-2 | BLEU-3 | BLEU-4 |
 |---|---|---|---|---|
 | Xu et al. 2015 (soft, Flickr8k) | 67.0 | 44.8 | 29.9 | 19.5 |
-| Ours — adaptive λ=0.01 | 62.2 | 43.4 | 29.4 | **19.8** |
+| Ours — adaptive λ=0.01 | 62.2 | 43.4 | 29.4 | 19.8 |
 | Ours — adaptive λ=1.0 | 62.4 | 43.6 | 29.1 | 18.8 |
 
 Key findings:
 - Lower doubly stochastic regularization (λ=0.01) consistently outperforms λ=1.0 on BLEU-4; the paper's large-λ formulation over-penalizes the attention distribution with only one sentinel location.
 - The visual sentinel in adaptive attention produces qualitatively sharper focus on objects versus diffuse backgrounds compared to standard soft attention.
-- VQA transfer (yes/no): the frozen encoder + soft attention adapted to binary classification with minimal changes, confirming that the spatial representation generalizes across tasks.
-- PCA of VGG features reveals that sky, foreground objects, and background separate into distinct color regions with zero supervision.
+- VQA transfer (yes/no): high amounts of overfitting because of one singular attention step. The feedback loop in the original paper was bypassed by the VQA adaption because VQA requires outputting a binary classfication, not a sentence in which the model can learn. 
 
 Attention visualization and training curves are in `results/`.
 
@@ -129,7 +129,7 @@ Attention visualization and training curves are in `results/`.
 
 ## 7. Conclusion
 
-We successfully reproduced the core BLEU-4 result from Xu et al. (2015) using a VGG-19 encoder and soft additive attention on Flickr8k. The adaptive attention extension (Lu et al. 2017) matched the paper target (BLEU-4 19.8 vs. 19.5) and produced more interpretable attention maps. The VQA transfer experiment demonstrated that the same encoder–attention backbone generalizes to classification tasks with minimal architectural change. The main lesson is that regularization weight selection (λ) is critical and the paper's recommended value does not always transfer to architectural variants.
+We successfully reproduced the core BLEU-4 result from Xu et al. (2015) using a VGG-19 encoder and soft additive attention on Flickr8k. The adaptive attention extension (Lu et al. 2017) matched the paper target (BLEU-4 19.8 vs. 19.5) and produced more interpretable attention maps. The VQA transfer experiment demonstrated that the same encoder–attention does not work well for classification because of a single attention step. The main lesson is that regularization weight selection (λ) is critical and the paper's recommended value does not always transfer to architectural variants.
 
 ---
 
