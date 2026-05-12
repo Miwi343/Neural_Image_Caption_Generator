@@ -5,7 +5,7 @@ Implements:
   - Cross-entropy loss over predicted word distribution
   - Doubly stochastic regularisation (Eq. 14): λ * Σ_i (1 - Σ_t α_ti)²
   - Gradient clipping (5.0) to stabilise LSTM training
-  - Adam optimiser on decoder parameters only (encoder is frozen)
+  - RMSProp optimiser on decoder parameters only (encoder is frozen, paper §4.3)
   - Per-epoch checkpointing + early stopping on validation BLEU-4
   - Batch length-bucketing for training speed (paper section 4.3)
 
@@ -19,7 +19,7 @@ Key hyperparameters (paper / standard community values):
   GRAD_CLIP      = 5.0
   BATCH_SIZE     = 64
   NUM_EPOCHS     = 50
-  PATIENCE       = 5     (early stop if BLEU-4 doesn't improve)
+  PATIENCE       = 10    (early stop if BLEU-4 doesn't improve)
 
 Future work (Issue #7, deferred): If training stability work is assigned, add
 `ReduceLROnPlateau` keyed on validation BLEU-4 and log exactly when the LR
@@ -38,7 +38,7 @@ import time
 
 import torch
 import torch.nn as nn
-from torch.optim import Adam
+from torch.optim import RMSprop
 from tqdm import tqdm
 
 from config import (
@@ -79,12 +79,10 @@ from utils.dataset import PAD_IDX
 
 
 def doubly_stochastic_attention_loss(alphas: torch.Tensor, weight: float = LAMBDA):
-    """Eq. 14: lambda * mean over (batch, locations) of (1 - sum_t alpha_ti)^2.
-    Using .mean() over locations keeps this term on the same scale as CE loss.
-    The original .sum(dim=1) over 196 locations inflated it ~196× and drowned
-    the CE gradient signal.
+    """Eq. 14: lambda * sum_i (1 - sum_t alpha_ti)^2, averaged over the batch.
+    alphas: (batch, T, L) — sum over T first, then sum over L locations.
     """
-    return weight * ((1.0 - alphas.sum(dim=1)) ** 2).mean()
+    return weight * ((1.0 - alphas.sum(dim=1)) ** 2).sum(dim=1).mean()
 
 
 def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoch,
@@ -95,16 +93,13 @@ def train_epoch(encoder, decoder, dataloader, optimizer, criterion, device, epoc
     Loss = cross-entropy + λ * doubly stochastic regularisation (Eq. 14).
 
     Args:
-        encoder:           Encoder (frozen until fine_tune_encoder=True)
-        decoder:           Decoder (always trained)
-        dataloader:        training DataLoader
-        optimizer:         Adam covering decoder (and encoder when fine-tuning)
-        criterion:         CrossEntropyLoss(ignore_index=PAD_IDX)
-        device:            torch.device
-        epoch:             current epoch number (for logging)
-        fine_tune_encoder: when True, encoder runs in train mode and gradients
-                           are computed through it; param group must already be
-                           added to optimizer before calling this.
+        encoder:    Encoder (frozen)
+        decoder:    Decoder (trained)
+        dataloader: training DataLoader
+        optimizer:  RMSProp on decoder params
+        criterion:  CrossEntropyLoss(ignore_index=PAD_IDX)
+        device:     torch.device
+        epoch:      current epoch number (for logging)
 
     Returns:
         avg_loss: float
@@ -268,9 +263,8 @@ def main():
         dropout=DROPOUT,
     ).to(device)
 
-    # Decoder optimizer — encoder params are added as a second group when
-    # fine-tuning starts so each group keeps its own LR.
-    optimizer = Adam(decoder.parameters(), lr=LEARNING_RATE)
+    # RMSProp — paper §4.3: "For Flickr8k we found RMSProp worked best."
+    optimizer = RMSprop(decoder.parameters(), lr=LEARNING_RATE)
 
     # Reduce LR by half when BLEU-4 stops improving for 3 epochs.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -308,8 +302,6 @@ def main():
         val_scores = validate(encoder, decoder, val_loader, vocab, device)
         val_bleu4 = val_scores["bleu4"]
         elapsed = time.time() - t0
-        scheduler.step(val_bleu4)
-
         print(
             f"Epoch {epoch:3d} | loss {train_loss:.4f} | "
             f"val BLEU-1 {val_scores['bleu1']*100:.2f} | "

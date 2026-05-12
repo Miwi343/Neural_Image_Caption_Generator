@@ -8,6 +8,7 @@ from models import Attention, Decoder, Encoder
 from train import doubly_stochastic_attention_loss
 from utils import Vocabulary, compute_bleu, tokenize_caption
 from utils.dataset import LengthBucketSampler
+from scripts.colab_setup import generate_split_files, normalize_flickr8k
 
 
 def test_tokenizer_and_vocab_strip_punctuation():
@@ -26,6 +27,14 @@ def test_tokenizer_and_vocab_strip_punctuation():
     assert encoded[0] == 1
     assert encoded[-1] == 2
     assert vocab.decode(encoded) == "a dog"
+
+
+def test_vocab_size_includes_special_tokens():
+    vocab = Vocabulary(max_size=6)
+    vocab.build(["one two three four five six seven"])
+
+    assert len(vocab) == 6
+    assert vocab.encode("one seven")[1:-1] == [vocab.word2idx["one"], 3]
 
 
 def test_bleu_omits_brevity_penalty():
@@ -80,9 +89,9 @@ def test_doubly_stochastic_loss_averages_over_batch_and_locations():
 
     loss = doubly_stochastic_attention_loss(alphas, weight=1.0)
 
-    # Location 0 sums to 1 → penalty 0; locations 1-3 sum to 0 → penalty 1 each.
-    # mean over (batch=2, locations=4): (0+1+1+1)*2 / 8 = 0.75
-    assert loss.item() == pytest.approx(0.75)
+    # Location 0 sums to 1 -> penalty 0; locations 1-3 sum to 0 -> penalty 1 each.
+    # Eq. 14 sums over locations and this implementation averages over batch.
+    assert loss.item() == pytest.approx(3.0)
 
 
 def test_encoder_reshapes_vgg_feature_map(monkeypatch):
@@ -94,7 +103,7 @@ def test_encoder_reshapes_vgg_feature_map(monkeypatch):
 
     import torchvision.models as tv_models
 
-    monkeypatch.setattr(tv_models, "vgg16", lambda weights: dummy_vgg)
+    monkeypatch.setattr(tv_models, "vgg19", lambda weights: dummy_vgg)
     encoder = Encoder(fine_tune=False)
 
     out = encoder(torch.randn(2, 3, 224, 224))
@@ -119,3 +128,50 @@ def test_length_bucket_sampler_uses_caption_lengths_and_full_batches():
 
     assert len(batches) == 1
     assert len(batches[0]) == 2
+
+
+def test_colab_split_generation_uses_paper_counts_when_possible(tmp_path):
+    captions = ["image,caption"]
+    captions.extend(f"image_{i:04d}.jpg,A caption {i}" for i in range(8001))
+    (tmp_path / "captions.txt").write_text("\n".join(captions) + "\n")
+
+    strict_compatible = generate_split_files(tmp_path)
+
+    assert strict_compatible is True
+    split_counts = {
+        path.name: len(path.read_text().splitlines())
+        for path in tmp_path.glob("Flickr_8k.*Images.txt")
+    }
+    assert split_counts == {
+        "Flickr_8k.trainImages.txt": 6000,
+        "Flickr_8k.devImages.txt": 1000,
+        "Flickr_8k.testImages.txt": 1000,
+    }
+
+
+def test_colab_setup_converts_official_token_file(tmp_path):
+    source = tmp_path / "source"
+    image_dir = source / "Flicker8k_Dataset"
+    image_dir.mkdir(parents=True)
+    for i in range(101):
+        (image_dir / f"image_{i:04d}.jpg").touch()
+
+    (source / "Flickr8k.token.txt").write_text(
+        "image_0000.jpg#0\tA dog runs.\n"
+        "image_0000.jpg#1\tA dog plays.\n"
+    )
+    for name in (
+        "Flickr_8k.trainImages.txt",
+        "Flickr_8k.devImages.txt",
+        "Flickr_8k.testImages.txt",
+    ):
+        (source / name).write_text("image_0000.jpg\n")
+
+    data_root = tmp_path / "data" / "flickr8k"
+    normalize_flickr8k(source, data_root, use_symlink=False, require_official_splits=True)
+
+    assert (data_root / "images" / "image_0000.jpg").exists()
+    assert (data_root / "captions.txt").read_text().splitlines() == [
+        "image_0000.jpg\tA dog runs.",
+        "image_0000.jpg\tA dog plays.",
+    ]

@@ -13,7 +13,7 @@ Special tokens:
   PAD = 0   (padding, ignored in loss)
   START = 1 (<start> prepended to every caption)
   END = 2   (<end> appended to every caption)
-  UNK = 3   (words outside the top-10000 vocabulary)
+  UNK = 3   (words outside the fixed 10,000-token vocabulary)
 
 Future work (Issue #8, deferred): If the project switches to `pack_padded_sequence` or
 `nn.LSTM`, sort collated batches by descending caption length and add a regression
@@ -178,8 +178,8 @@ class Vocabulary:
     """
     Word ↔ integer index mapping.
 
-    Build from a list of caption strings, keeping the top `max_size` words
-    (excluding specials).  Save/load as JSON so the vocab can be reused
+    Build from a list of caption strings, keeping a fixed total vocabulary size
+    including special tokens. Save/load as JSON so the vocab can be reused
     across runs without rebuilding from scratch.
 
     Future work (Issue #2, deferred): If vocabulary tuning is assigned, add a
@@ -219,8 +219,10 @@ class Vocabulary:
         self.word2idx = {w: i for w, i in specials}
         self.idx2word = {i: w for w, i in specials}
 
-        # Add most common words
-        for idx, (word, _) in enumerate(counter.most_common(self.max_size), start=4):
+        # Add most common words while keeping the total vocabulary size fixed
+        # at `max_size`, including the four special tokens.
+        num_words = max(self.max_size - len(specials), 0)
+        for idx, (word, _) in enumerate(counter.most_common(num_words), start=4):
             self.word2idx[word] = idx
             self.idx2word[idx] = word
 
@@ -295,14 +297,13 @@ class Vocabulary:
 # Dataset
 # ---------------------------------------------------------------------------
 
-# ImageNet normalisation used by the pretrained VGG-16 encoder
+# ImageNet normalisation used by the pretrained VGG-19 encoder
 _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 _TRAIN_TRANSFORM = transforms.Compose([
     transforms.Resize(256),
-    transforms.RandomCrop(224),
-    transforms.RandomHorizontalFlip(),
+    transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
 ])

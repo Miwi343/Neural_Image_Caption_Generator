@@ -59,12 +59,14 @@ class Attention(nn.Module):
         """
         super().__init__()
 
-        # Linear projections (no bias so we control the affine transform)
-        # W_a  : annotation vectors  a_i  → attention_dim
+        # Linear projections matching the authors' Theano implementation:
+        # context projection has a bias, hidden-state projection does not, and
+        # the scalar energy projection has its own bias.
+        # W_a  : annotation vectors  a_i  -> attention_dim
         self.encoder_att = nn.Linear(encoder_dim, attention_dim)
-        # W_h  : previous hidden state h_{t-1} → attention_dim
-        self.decoder_att = nn.Linear(decoder_dim, attention_dim)
-        # v    : attention_dim → scalar energy
+        # W_h  : previous hidden state h_{t-1} -> attention_dim
+        self.decoder_att = nn.Linear(decoder_dim, attention_dim, bias=False)
+        # v    : attention_dim -> scalar energy
         self.full_att = nn.Linear(attention_dim, 1)
 
         self.tanh = nn.Tanh()

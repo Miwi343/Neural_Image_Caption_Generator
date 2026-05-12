@@ -3,10 +3,10 @@
 This script is intentionally Colab-friendly:
   - validates the repo and Flickr8k layout
   - can normalize common Flickr8k/Kaggle folder layouts
-  - auto-generates train/val/test split files when only images/ and captions.txt
-    are present (the typical Kaggle download layout)
+  - downloads official train/val/test split files when only images/ and
+    captions.txt are present (the typical Kaggle download layout)
+  - can download the public Flickr8k image/text release into data/flickr8k
   - can download/unzip a Kaggle dataset when kaggle.json is available
-  - keeps checkpoints/results inside the repo folder in Drive
 """
 
 import argparse
@@ -15,6 +15,7 @@ import os
 import random as _random
 import shutil
 import subprocess
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -31,9 +32,18 @@ SPLIT_FILES = [
     "Flickr_8k.devImages.txt",
     "Flickr_8k.testImages.txt",
 ]
+OFFICIAL_TEXT_ZIP_URL = (
+    "https://github.com/jbrownlee/Datasets/releases/download/"
+    "Flickr8k/Flickr8k_text.zip"
+)
+OFFICIAL_IMAGE_ZIP_URL = (
+    "https://github.com/jbrownlee/Datasets/releases/download/"
+    "Flickr8k/Flickr8k_Dataset.zip"
+)
 
-# Val and test are fixed at 1000 each; training gets ALL remaining images.
-N_VAL  = 1000
+# Paper/Flickr8k split sizes.
+N_TRAIN = 6000
+N_VAL = 1000
 N_TEST = 1000
 
 
@@ -93,11 +103,12 @@ def generate_split_files(data_root: Path) -> bool:
     """
     Generate Flickr_8k.{train,dev,test}Images.txt from captions.txt image names.
 
-    Uses a fixed random seed (42) for reproducibility.  The standard 6000/1000/1000
-    split is produced when the dataset has ≥ 8000 unique images; a proportional
+    Uses a fixed random seed (42) for reproducibility. The standard 6000/1000/1000
+    split is produced when the dataset has >= 8000 unique images; a proportional
     75/12.5/12.5 split is used for smaller datasets.
 
-    Returns True if any files were written.
+    Returns True when the generated split is compatible with strict Flickr8k
+    count validation.
     """
     captions_path = data_root / "captions.txt"
     if not captions_path.exists():
@@ -114,10 +125,18 @@ def generate_split_files(data_root: Path) -> bool:
     rng.shuffle(shuffled)
 
     n = len(shuffled)
-    # Reserve fixed val/test pools; every remaining image goes to training.
-    n_val   = min(N_VAL,  max(1, n // 8))
-    n_test  = min(N_TEST, max(1, n // 8))
-    n_train = n - n_val - n_test
+    if n >= (N_TRAIN + N_VAL + N_TEST):
+        # Match the paper's Flickr8k protocol: 6000 train, 1000 validation,
+        # 1000 test. Any extra images from a Kaggle archive are left unused.
+        n_train, n_val, n_test = N_TRAIN, N_VAL, N_TEST
+        strict_count_compatible = True
+    else:
+        # Small custom/debug datasets can still run end to end, but they are
+        # explicitly not paper-comparable.
+        n_val = max(1, n // 8)
+        n_test = max(1, n // 8)
+        n_train = n - n_val - n_test
+        strict_count_compatible = False
 
     splits = [
         ("Flickr_8k.trainImages.txt", shuffled[:n_train]),
@@ -134,10 +153,98 @@ def generate_split_files(data_root: Path) -> bool:
             wrote_any = True
         else:
             print(f"  {filename} already exists — skipping")
-    return wrote_any
+    if n > (n_train + n_val + n_test):
+        print(f"  Leaving {n - (n_train + n_val + n_test)} extra images unused.")
+    if not wrote_any:
+        print("  Split files already existed; no files were written.")
+    return strict_count_compatible
 
 
-def normalize_flickr8k(source_dir: Path, data_root: Path, use_symlink: bool = True):
+def download_if_missing(url: str, zip_path: Path) -> None:
+    """Download a release asset once, leaving existing archives in place."""
+    ensure_dir(zip_path.parent)
+    if not zip_path.exists():
+        print(f"Downloading {url}")
+        urllib.request.urlretrieve(url, zip_path)
+
+
+def convert_token_file_to_captions(token_file: Path, captions_path: Path) -> None:
+    """Convert official Flickr8k.token.txt rows into this repo's captions.txt."""
+    if captions_path.exists():
+        return
+
+    rows = []
+    with open(token_file, encoding="utf-8", errors="replace") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or "\t" not in line:
+                continue
+            image_id, caption = line.split("\t", 1)
+            image_name = os.path.basename(image_id.strip().split("#")[0])
+            caption = caption.strip()
+            if image_name and caption:
+                rows.append(f"{image_name}\t{caption}")
+
+    if not rows:
+        raise ValueError(f"No caption rows could be read from {token_file}.")
+
+    ensure_dir(captions_path.parent)
+    captions_path.write_text("\n".join(rows) + "\n")
+    print(f"  Converted {token_file.name} -> {captions_path}")
+
+
+def download_official_split_files(data_root: Path, download_dir: Path | None = None) -> bool:
+    """Download the official Flickr8k text archive and copy split files."""
+    download_dir = download_dir or (data_root / "_official_text")
+    ensure_dir(download_dir)
+    zip_path = download_dir / "Flickr8k_text.zip"
+    download_if_missing(OFFICIAL_TEXT_ZIP_URL, zip_path)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(download_dir)
+
+    copied = False
+    for filename in SPLIT_FILES:
+        src = find_first(download_dir, [filename])
+        if src is not None and not (data_root / filename).exists():
+            shutil.copy2(src, data_root / filename)
+            print(f"  Copied official {filename}")
+            copied = True
+    return copied
+
+
+def download_public_flickr8k_release(
+    data_root: Path,
+    download_dir: Path | None = None,
+) -> bool:
+    """Download the public Flickr8k image/text release and normalize it."""
+    download_dir = download_dir or (data_root / "_public_download")
+    ensure_dir(download_dir)
+
+    image_zip = download_dir / "Flickr8k_Dataset.zip"
+    text_zip = download_dir / "Flickr8k_text.zip"
+    download_if_missing(OFFICIAL_IMAGE_ZIP_URL, image_zip)
+    download_if_missing(OFFICIAL_TEXT_ZIP_URL, text_zip)
+
+    for zip_path in (image_zip, text_zip):
+        print(f"Extracting {zip_path}")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(download_dir)
+
+    return normalize_flickr8k(
+        download_dir,
+        data_root,
+        use_symlink=True,
+        require_official_splits=True,
+    )
+
+
+def normalize_flickr8k(
+    source_dir: Path,
+    data_root: Path,
+    use_symlink: bool = True,
+    require_official_splits: bool = False,
+):
     """Normalize common Kaggle/official Flickr8k layouts into data/flickr8k.
 
     Handles two common layouts:
@@ -186,11 +293,17 @@ def normalize_flickr8k(source_dir: Path, data_root: Path, use_symlink: bool = Tr
     # ------------------------------------------------------------------
     captions_src = find_first(source_dir, ["captions.txt"])
     if captions_src is None:
-        raise FileNotFoundError(f"Could not find captions.txt under {source_dir}.")
-    copy_or_link(captions_src, data_root / "captions.txt", use_symlink=use_symlink)
+        token_src = find_first(source_dir, ["Flickr8k.token.txt"])
+        if token_src is None:
+            raise FileNotFoundError(
+                f"Could not find captions.txt or Flickr8k.token.txt under {source_dir}."
+            )
+        convert_token_file_to_captions(token_src, data_root / "captions.txt")
+    else:
+        copy_or_link(captions_src, data_root / "captions.txt", use_symlink=use_symlink)
 
     # ------------------------------------------------------------------
-    # 3. Split files — link if present, otherwise auto-generate
+    # 3. Split files — link if present, otherwise fetch official files
     # ------------------------------------------------------------------
     for filename in SPLIT_FILES:
         src = find_first(source_dir, [filename])
@@ -198,20 +311,36 @@ def normalize_flickr8k(source_dir: Path, data_root: Path, use_symlink: bool = Tr
             copy_or_link(src, data_root / filename, use_symlink=use_symlink)
 
     missing_splits = [f for f in SPLIT_FILES if not (data_root / f).exists()]
-    splits_generated = False
+    strict_count_compatible = True
     if missing_splits:
         print(
-            "Split files not found in source directory — generating from captions.txt:\n  "
+            "Split files not found in source directory — trying official Flickr8k text archive:\n  "
             + "\n  ".join(missing_splits)
         )
-        generate_split_files(data_root)
-        splits_generated = True
+        try:
+            download_official_split_files(data_root)
+        except Exception as exc:
+            if require_official_splits:
+                raise RuntimeError(
+                    "Official Flickr8k split files are required for the paper "
+                    "reproduction but could not be downloaded."
+                ) from exc
+            print(f"Official split download failed ({exc}); generating count-compatible splits.")
+
+        missing_splits = [f for f in SPLIT_FILES if not (data_root / f).exists()]
+        if missing_splits:
+            if require_official_splits:
+                raise FileNotFoundError(
+                    "Official Flickr8k split files are required for the paper "
+                    "reproduction. Missing:\n  " + "\n  ".join(missing_splits)
+                )
+            strict_count_compatible = generate_split_files(data_root)
 
     print(f"\nFlickr8k is ready at {data_root}")
     print("Contents:")
     for child in sorted(data_root.iterdir()):
         print(" ", child)
-    return splits_generated
+    return strict_count_compatible
 
 
 def download_from_kaggle(dataset: str, download_dir: Path):
@@ -237,6 +366,16 @@ def main():
     parser.add_argument("--repo_dir", default=".")
     parser.add_argument("--data_root", default="data/flickr8k")
     parser.add_argument("--source_dir", default="")
+    parser.add_argument(
+        "--download_public_flickr8k",
+        action="store_true",
+        help="Download the public Flickr8k release assets into data_root.",
+    )
+    parser.add_argument(
+        "--public_download_dir",
+        default="",
+        help="Optional cache directory for --download_public_flickr8k.",
+    )
     parser.add_argument("--download_kaggle", action="store_true")
     parser.add_argument(
         "--kaggle_dataset",
@@ -250,10 +389,24 @@ def main():
         action="store_true",
         help="Skip exact split-count validation (useful when dataset size differs from standard 8000).",
     )
+    parser.add_argument(
+        "--require_official_splits",
+        action="store_true",
+        help="Fail instead of generating random splits when official Flickr8k split files are missing.",
+    )
     args = parser.parse_args()
 
     repo_dir = Path(args.repo_dir).expanduser().resolve()
     data_root = (repo_dir / args.data_root).resolve()
+
+    if args.download_public_flickr8k:
+        public_download_dir = Path(args.public_download_dir) if args.public_download_dir else None
+        strict_count_compatible = download_public_flickr8k_release(
+            data_root,
+            public_download_dir,
+        )
+        validate(data_root, strict=(not args.no_strict and strict_count_compatible))
+        return
 
     if args.download_kaggle:
         download_dir = Path(args.kaggle_download_dir)
@@ -264,9 +417,13 @@ def main():
     else:
         source_dir = data_root
 
-    splits_generated = normalize_flickr8k(source_dir, data_root, use_symlink=not args.copy)
-    # Skip strict count check when we auto-generated splits (training size differs from 6000).
-    validate(data_root, strict=not (args.no_strict or splits_generated))
+    strict_count_compatible = normalize_flickr8k(
+        source_dir,
+        data_root,
+        use_symlink=not args.copy,
+        require_official_splits=args.require_official_splits,
+    )
+    validate(data_root, strict=(not args.no_strict and strict_count_compatible))
 
 
 if __name__ == "__main__":

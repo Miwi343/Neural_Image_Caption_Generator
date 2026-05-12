@@ -2,13 +2,13 @@
 
 PyTorch reproduction of **Show, Attend and Tell: Neural Image Caption Generation with Visual Attention** (Xu et al., 2015) on Flickr8k.
 
-The implementation uses a frozen ImageNet VGG-16 encoder, additive soft attention over `14x14x512` annotation vectors, scalar beta gating, an LSTM decoder with the paper's deep output layer, and doubly stochastic attention regularization.
+The implementation uses a frozen ImageNet VGG-19/OxfordNet encoder, additive soft attention over `14x14x512` annotation vectors, scalar beta gating, an LSTM decoder with the paper's deep output layer, and doubly stochastic attention regularization.
 
 ## Repository Layout
 
 ```text
 models/
-  encoder.py       VGG-16 feature extractor
+  encoder.py       VGG-19 feature extractor
   attention.py     soft additive attention
   decoder.py       LSTM decoder and deep output layer
 model.py           end-to-end encoder/decoder wrapper
@@ -32,7 +32,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-On Colab Pro, install the requirements after mounting the repo and use the GPU runtime. The first encoder construction downloads the torchvision VGG-16 ImageNet weights if they are not already cached.
+On Colab Pro, install the requirements after mounting the repo and use the GPU runtime. The first encoder construction downloads the torchvision VGG-19 ImageNet weights if they are not already cached.
 
 Run the regression tests:
 
@@ -53,7 +53,7 @@ data/flickr8k/
   Flickr_8k.testImages.txt
 ```
 
-The loader validates the standard split sizes: train `6000`, validation `1000`, test `1000`. Captions are lowercased and punctuation is stripped before vocabulary building and BLEU scoring. The vocabulary keeps the top `10000` training words plus the four special tokens.
+The loader validates the standard split sizes: train `6000`, validation `1000`, test `1000`. Captions are lowercased and punctuation is stripped before vocabulary building and BLEU scoring. The vocabulary size is fixed at `10000` total tokens, including the four special tokens.
 
 ## Train
 
@@ -72,7 +72,7 @@ results/training_log.csv
 The best checkpoint is selected by validation BLEU-4, not validation loss. The loss is:
 
 ```text
-cross_entropy + lambda * mean((1 - sum_t alpha_ti)^2)
+cross_entropy + lambda * sum_i((1 - sum_t alpha_ti)^2)
 ```
 
 with `lambda=1.0` by default.
