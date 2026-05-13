@@ -125,6 +125,20 @@ Key findings:
 
 Attention visualization and training curves are in `results/`.
 
+**Adaptive Attention Visualizations**
+
+*Sentinel weight (β) per generated token — blue = visual attention, red = language model sentinel.*
+
+![Sentinel weights](results/adaptive_attention/adaptive_sentinel_weights.png)
+
+The sentinel weights reveal a clean pattern: content words like "dog" (β=0.06) and "bench" (β=0.00) are almost entirely grounded in visual attention, while function words like "a" (β=0.59, β=0.52) rely heavily on the language model sentinel instead. The model learned on its own that articles and conjunctions have no meaningful visual grounding.
+
+*Spatial attention maps per generated token.*
+
+![Spatial attention maps](results/adaptive_attention/adaptive_attention_maps.png)
+
+The spatial maps confirm this. "Man" and "dog" produce tight, localized attention over the correct image regions, while function words show diffuse, noisy maps as expected since the sentinel absorbs most of their weight, keeping spatial attention for content words clean and interpretable.
+
 ---
 
 ## 7. Conclusion
