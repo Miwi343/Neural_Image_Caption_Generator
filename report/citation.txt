@@ -11,4 +11,4 @@ translate mathematical ideas into code. All final code, experiments, results,
 and project decisions were reviewed and validated by the project team.
 
 We used tools such as ChatGPT, OpenAI Codex, and Anthropic's claude using prompt-
-engineerign techniques we learned in this class.
+engineering techniques we learned in this class.
